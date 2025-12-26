@@ -117,6 +117,7 @@ class ContextManager:
             False,
             (kvcaches[0].shape[0] == 2)
         )
+        self.kv[layer_idx] = None
 
     def init(self, query , key):
         logger.info(f"ContextManager: Initializing with query and key shapes. Query shape: {query.shape}, Key shape: {key.shape}")
@@ -284,7 +285,7 @@ class ContextManager:
             )
         )
 
-        print(f"Layer {layer_idx} recompute {recomputed_idx.size(0)}/{query.size(1)} tokens.")
+        # print(f"Layer {layer_idx} recompute {recomputed_idx.size(0)}/{query.size(1)} tokens.")
         # step 3: compute the attention
         o = self.prefill(query, key, value, layer_idx ,blend_meta)
 

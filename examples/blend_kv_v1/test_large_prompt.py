@@ -169,7 +169,7 @@ async def main():
     question2 = tokenizer.encode("What do you think?")[1:]
     question3 = tokenizer.encode("Can you assist?")[1:]
 
-    prompt1 = sys_prompt + sep + chunk1 + sep + chunk2 + sep + chunk3 + sep + question1
+    prompt1 = sys_prompt  + chunk1  + chunk2  + chunk3  + question1
     prompt2 = sys_prompt + sep + chunk2 + sep + chunk1 + sep + chunk3 + sep + question2
     prompt3 = sys_prompt + sep + chunk3 + sep + chunk1 + sep + chunk2 + sep + question3
 
@@ -188,9 +188,31 @@ async def main():
     print()
 
     async with aiohttp.ClientSession() as session:
-        prompts = [info[1] for info in request_info]
+        # 预热阶段：先store cache，等待系统稳定
+        print("=" * 60)
+        print("预热阶段：存储cache...")
+        print("=" * 60)
+        warmup_metrics = await stream_completion(
+            session=session,
+            prompt=prompt1,
+            request_name="[预热-Store]"
+        )
+        print("[预热-Store] 完成")
+        print_metrics(warmup_metrics)
+        print()
+
+        print("等待3秒后开始正式测试（测试retrieve性能）...")
+        await asyncio.sleep(3)
+        print()
+
+        print("=" * 60)
+        print("开始正式测试（只测试prompt2和prompt3的retrieve性能）")
+        print("=" * 60)
+
+        # 只测试prompt2和prompt3（它们会retrieve cache）
+        prompts = [info[1] for info in request_info[1:]]  # 跳过prompt1
         tasks = []
-        idx = 0
+        idx = 1  # 从request_info[1]开始
         async for prompt in send_requests_with_rate_limit(
             prompts, args.request_rate, args.burstiness
         ):
@@ -206,24 +228,25 @@ async def main():
 
         metrics_list = await asyncio.gather(*tasks)
 
-    metrics1, metrics2, metrics3 = metrics_list
-
-    print(request_info[0][0])
-    print_metrics(metrics1)
     print()
+    print("=" * 60)
+    print("正式测试结果")
+    print("=" * 60)
+
+    metrics2, metrics3 = metrics_list
 
     print(request_info[1][0])
     print_metrics(metrics2)
-    if metrics1["ttft"] is not None and metrics2["ttft"] is not None:
-        print(f"加速比: {metrics1['ttft']/metrics2['ttft']:.2f}x")
+    if warmup_metrics["ttft"] is not None and metrics2["ttft"] is not None:
+        print(f"相比预热加速比: {warmup_metrics['ttft']/metrics2['ttft']:.2f}x")
     else:
         print("加速比: 无法计算（缺少TTFT数据）")
     print()
 
     print(request_info[2][0])
     print_metrics(metrics3)
-    if metrics1["ttft"] is not None and metrics3["ttft"] is not None:
-        print(f"加速比: {metrics1['ttft']/metrics3['ttft']:.2f}x")
+    if warmup_metrics["ttft"] is not None and metrics3["ttft"] is not None:
+        print(f"相比预热加速比: {warmup_metrics['ttft']/metrics3['ttft']:.2f}x")
     else:
         print("加速比: 无法计算（缺少TTFT数据）")
     print()

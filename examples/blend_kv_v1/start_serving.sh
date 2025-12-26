@@ -8,7 +8,7 @@ export LMCACHE_ENABLE_BLENDING=True
 export LMCACHE_BLEND_SPECIAL_STR=" # # "
 export LMCACHE_USE_LAYERWISE=True
 export LMCACHE_BLEND_CHECK_LAYERS=1
-export LMCACHE_BLEND_RECOMPUTE_RATIOS=0.3  # 提高到30%，增强out-of-order blend效果
+export LMCACHE_BLEND_RECOMPUTE_RATIOS=0.15  # 提高到30%，增强out-of-order blend效果
 export LMCACHE_BLEND_MIN_TOKENS=64  # 降低最小blend tokens，让小batch也能blend
 
 # CPU后端配置
