@@ -8,8 +8,7 @@ class SVDQ(AbstractCompress):
     """
     def __init__(self, device="cuda", config: dict = None):
         super().__init__(device=device)
-        config = config or {}
-        self.sechdual_bit = config.get("sechdual_bit", [8 , 4 , 2 , 1 , 1 ])
+        self.sechdual_bit =  [8,4,4]
 
     def second_compress(self, data, prefix = "key") -> dict:
         us  , v = data

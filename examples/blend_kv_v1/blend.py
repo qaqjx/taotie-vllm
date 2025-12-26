@@ -173,9 +173,9 @@ def main():
 
         print_output(llm, warmup_prompt, sampling_params, "warmup")
 
-        # print_output(llm, chunk1, sampling_params, "chunk1-only")
-        # print_output(llm, chunk2, sampling_params, "chunk2-only")
-        # print_output(llm, chunk3, sampling_params, "chunk3-only")
+        print_output(llm, chunk1, sampling_params, "chunk1-only")
+        print_output(llm, chunk2, sampling_params, "chunk2-only")
+        print_output(llm, chunk3, sampling_params, "chunk3-only")
 
         # Print the first output
         print_output(llm, first_prompt, sampling_params, "first")

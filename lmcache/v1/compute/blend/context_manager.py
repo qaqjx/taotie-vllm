@@ -141,11 +141,11 @@ class ContextManager:
         """
         Save the key and value tensors to the disk.
         hash_str: the hash string of the text
-        """
+        """ 
 
         for idx , kv in enumerate(self.kv):
             self.kv_manager.store_data(get_kvcache_filename(text_hash, layer_idx=idx ,device=self.device), kv, scores , layer_idx=idx)
-
+ 
     def store_chunks_kv(self, store_text_hashs: List , store_indices: List, layer_idx: int):
 
         for text_hash , indices in zip(store_text_hashs , store_indices):

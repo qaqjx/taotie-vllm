@@ -169,6 +169,10 @@ async def main():
     question2 = tokenizer.encode("What do you think?")[1:]
     question3 = tokenizer.encode("Can you assist?")[1:]
 
+    # prompt1 = chunk1
+    # prompt2 = chunk2
+    # prompt3 = chunk3
+
     prompt1 = sys_prompt  + chunk1  + chunk2  + chunk3  + question1
     prompt2 = sys_prompt + sep + chunk2 + sep + chunk1 + sep + chunk3 + sep + question2
     prompt3 = sys_prompt + sep + chunk3 + sep + chunk1 + sep + chunk2 + sep + question3

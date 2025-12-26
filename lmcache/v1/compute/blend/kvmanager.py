@@ -29,7 +29,7 @@ class CompressFactory:
         elif compress_type == CompressType.KIVI_2BIT:
             return Kivi2Bit(device=device, config=compress_config)
         elif compress_type == CompressType.OURS:
-            return Ours(device=device , layer_num = layer_num, config=compress_config)
+            return Ours(device=device)
         elif compress_type == CompressType.SVDQ:
             return SVDQ(device=device, config=compress_config)
   
@@ -89,7 +89,7 @@ class KVCacheManager:
         device="cuda",
         shape=None,
         max_buffer_size=16 * 1024 * 1024 * 1024,
-        compress_type=CompressType.NONE,
+        compress_type=CompressType.OURS,
         compress_config=None,
         io_config: Optional[Dict[str, Any]] = None,
     ):
@@ -159,7 +159,6 @@ class KVCacheManager:
         """
         Save data to a file or cpu.
         """
-        logger.info(f"Storing data for key: {key} at layer {layer_idx} with compress type {self.compress_type}")
         data = self.compressor.compress(data , score , layer_idx=layer_idx)
         flag = self.db.store_data(key, data)
         

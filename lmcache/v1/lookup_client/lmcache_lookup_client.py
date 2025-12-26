@@ -210,7 +210,7 @@ class LMCacheLookupServer:
                         pin=True,
                         request_configs=request_configs,
                     )
-                result = len(tokens) - 1
+                result = len(tokens) 
                 response = result.to_bytes(4, "big") 
                 logger.info(f"Cache hit number: {result} for lookup_id: {lookup_id}")
                 self.socket.send(response)

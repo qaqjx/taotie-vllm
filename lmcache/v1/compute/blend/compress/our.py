@@ -61,9 +61,13 @@ def calculate_elbow(singular_value: torch.Tensor) -> float:
 class UniformAllocate():
     def __init__(self):
         pass
-    
+    def _calculate_ranks(self, total_budget_bytes: int, num_layers: int, dim: int, token: int) -> int:
+        budget_per_rank = 4 * 16 + (token + dim) * 4  # 4 bytes per float
+        return total_budget_bytes * 8 // budget_per_rank
+        
     def allocate(self, total_budget_bytes: int, num_layers: int, dim: int, token_num: int,
                  score: list = None, max_rank: int = 0) -> list:
+
         all_rank = self._calculate_ranks(total_budget_bytes, num_layers, dim, token_num)
         
         rank_per_layer = int(all_rank // num_layers)
@@ -72,10 +76,9 @@ class UniformAllocate():
 
 
 class Ours(AbstractCompress):
-    def __init__(self, layer_num: int = 0, device="cuda", config: dict = None):
+    def __init__(self, device="cuda", config: dict = None):
         super().__init__(device=device)
-        self.layer_num = layer_num
-        self.ratio = config.get("ratio", 0.2)
+        self.ratio = 0.05
         self.last_final_ranks = None
 
     def sq_compress(self, data) -> dict:

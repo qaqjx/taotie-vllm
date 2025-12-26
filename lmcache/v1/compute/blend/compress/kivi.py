@@ -334,8 +334,8 @@ class Kivi2Bit(AbstractCompress):
         # print("Using SQ4 compression")
         super().__init__(device=device)
         config = config or {}
-        self.residual_length = config.get("residual_length", 128)
-        self.group_size = config.get("group_size", 32)
+        self.residual_length = 32
+        self.group_size = 32
         self.num_bits = 2
         # print("Using KIVI 2-bit compression with residual length:", self.residual_length)
 
