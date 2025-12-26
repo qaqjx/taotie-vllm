@@ -373,10 +373,12 @@ class LMCacheEngine:
             keys_multi_layer = key.split_layers(self.num_layers)
             # Only check the first layer
             if self.storage_manager.contains(keys_multi_layer[0]):
+                logger.debug(f"STORE: Segment [{start}:{end}] already exists, skipping")
                 continue
 
             # Allocate the memory object
             num_tokens = end - start
+            logger.info(f"STORE: Storing segment [{start}:{end}] with {num_tokens} tokens, key={key}")
             kv_shape_single_layer = self.gpu_connector.get_shape(num_tokens)
 
             memory_objs_multi_layer = self.storage_manager.batched_allocate(
@@ -585,55 +587,57 @@ class LMCacheEngine:
 
             # NOTE: Only check the first layer
             if not self.storage_manager.contains(keys_multi_layer[0]):
+                logger.info(f"LOAD: Segment [{start}:{end}] NOT FOUND, breaking")
                 break
 
+            logger.info(f"LOAD: Segment [{start}:{end}] FOUND, loading {end-start} tokens")
             starts.append(start)
             ends.append(end)
             keys.append(keys_multi_layer)
 
             ret_mask[start:end] = True
 
-        if keys:
-            # Transpose the keys into layer major format
-            keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
+    # if keys:
+        # Transpose the keys into layer major format
+        keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
-            get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
+        get_generator = self.storage_manager.layerwise_batched_get(keys_layer_major)
 
-            assert isinstance(
-                self.gpu_connector,
-                (
-                    VLLMPagedMemLayerwiseGPUConnector,
-                    VLLMBufferLayerwiseGPUConnector,
-                    SGLangLayerwiseGPUConnector,
-                ),
-            )
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
-            next(mem_obj_consumer)
+        assert isinstance(
+            self.gpu_connector,
+            (
+                VLLMPagedMemLayerwiseGPUConnector,
+                VLLMBufferLayerwiseGPUConnector,
+                SGLangLayerwiseGPUConnector,
+            ),
+        )
+        mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+        next(mem_obj_consumer)
 
-            to_count_down = []
-            for layer_id in range(self.num_layers):
-                task = next(get_generator)
+        to_count_down = []
+        for layer_id in range(self.num_layers):
+            task = next(get_generator)
 
-                assert task is not None
+            assert task is not None
 
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
-                else:
-                    yield None
-
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
-                to_count_down.extend(mem_objs_layer)
-
-            for mem_obj in to_count_down:
-                mem_obj.ref_count_down()
-        else:
-            # If no cache are found, we still need to yield to avoid
-            # `StopIteration`
-            for layer_id in range(self.num_layers):
+            if layer_id == 0:
+                # NOTE(Yuwei): For sglang integration we need to provide retrieved
+                # tokens number in the first layer loading since there is no lookup
+                yield torch.sum(ret_mask)
+            else:
                 yield None
+
+            mem_objs_layer = task.result()
+            mem_obj_consumer.send(mem_objs_layer)
+            to_count_down.extend(mem_objs_layer)
+
+        for mem_obj in to_count_down:
+            mem_obj.ref_count_down()
+    # else:
+    #     # If no cache are found, we still need to yield to avoid
+    #     # `StopIteration`
+    #     for layer_id in range(self.num_layers):
+    #         yield None
 
         yield None
 

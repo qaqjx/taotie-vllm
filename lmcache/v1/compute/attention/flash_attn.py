@@ -54,6 +54,35 @@ class LMCFlashAttnBackend(AttentionInterface):
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
 
+        # CRITICAL FIX: Handle invalid query length from CPU offload blend
+        # When blending with CPU offload, query_len can be 0 in decode phase
+        # This causes "CUDA error: invalid configuration argument"
+        if max_seqlen_q == 0 or query.shape[0] == 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Invalid query length: max_seqlen_q={max_seqlen_q}, "
+                f"query.shape={query.shape}. Skipping blend attention."
+            )
+            # Return zero output for invalid query (decode phase edge case)
+            output.zero_()
+            return output
+
+        # CRITICAL FIX: Detect K/V mismatch (common in large sequence blending)
+        # Flash Attention requires num_heads_q % num_heads_kv == 0 (GQA)
+        if query.shape[1] != key.shape[1] and query.shape[0] > 1:
+            num_heads_q = query.shape[1]  # e.g. 32
+            num_heads_kv = key.shape[1]   # e.g. 8
+            if num_heads_q % num_heads_kv != 0:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(
+                    f"Invalid head configuration: q_heads={num_heads_q}, "
+                    f"kv_heads={num_heads_kv}. Cannot use Flash Attention."
+                )
+                output.zero_()
+                return output
+
         descale_shape = (cu_seqlens_q.shape[0] - 1, key.shape[1])
 
         # TODO(Jiayi): Figure out how to use aot_schedule.
@@ -66,7 +95,6 @@ class LMCFlashAttnBackend(AttentionInterface):
             max_seq_len=max_seqlen_k,
             causal=True,  # Assuming causal attention
         )
-
         flash_attn_varlen_func(
             q=query,  # contiguous
             k=key,  # contiguous

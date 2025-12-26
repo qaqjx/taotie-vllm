@@ -203,13 +203,16 @@ class LMCacheLookupServer:
                 else:
                     token_frames = frames[0]
                     tokens = self.decoder.decode(token_frames)
+                    # result is the cache hit token number
                     result = self.lmcache_engine.lookup(
                         tokens=tokens,
                         lookup_id=lookup_id,
                         pin=True,
                         request_configs=request_configs,
                     )
+                    result = len(tokens)
                 response = result.to_bytes(4, "big")
+                logger.info(f"Cache hit number: {result} for lookup_id: {lookup_id}")
                 self.socket.send(response)
 
         logger.info(f"lmcache lookup server start on {socket_path}")

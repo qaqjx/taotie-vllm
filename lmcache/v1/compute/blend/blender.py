@@ -40,7 +40,6 @@ class LMCBlender:
         # TODO: remove this hardcode
         self.num_layers = len(vllm_model.model.layers)
 
-        # TODO(Jiayi): support threshold-based blending
         # TODO(Jiayi): support different ratios for different layers
         # TODO(Jiayi): support "skipping blending if hit too short"
         self.common_metadata = LMCBlendCommonMetadata(
@@ -91,19 +90,47 @@ class LMCBlender:
             )
             total_len = diff_k.shape[0]
 
-            assert self.common_metadata.recomp_ratios is not None
+            threshold_indices = None
+            if self.common_metadata.thresholds is not None:
+                threshold = self.common_metadata.thresholds[0]
+                above_threshold = diff_k >= threshold
+                if torch.any(above_threshold):
+                    threshold_indices = torch.nonzero(
+                        above_threshold, as_tuple=False
+                    ).squeeze(1)
 
-            # TODO(Jiayi): remove `[0]` hardcode
-            topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+            if threshold_indices is not None:
+                top_indices, _ = torch.sort(threshold_indices)
+                topk_num = threshold_indices.shape[0]
+            else:
+                assert self.common_metadata.recomp_ratios is not None
 
-            top_indices = torch.topk(diff_k, k=topk_num).indices
-            top_indices, _ = torch.sort(top_indices)
+                # TODO(Jiayi): remove `[0]` hardcode
+                topk_num = int(total_len * self.common_metadata.recomp_ratios[0])
+
+                # CRITICAL FIX: Ensure at least 1 token for blend when ratio is too small
+                # This happens in decode phase with small sequences (e.g., total_len < 20 with ratio=0.05)
+                # Instead of skipping blend entirely, recompute at least 1 token to enable out-of-order matching
+                if topk_num == 0 and total_len > 0:
+                    topk_num = 1
+                    logger.debug(
+                        f"Adjusted topk_num from 0 to 1 for layer {layer_id} "
+                        f"(total_len={total_len}, ratio={self.common_metadata.recomp_ratios[0]}) "
+                        f"to enable small-batch blending."
+                    )
+
+                top_indices = torch.topk(diff_k, k=topk_num).indices
+                top_indices, _ = torch.sort(top_indices)
+                threshold = None  # keep scope for logging below if needed
+
+            logger.debug(
+                f"Number of indices picked: {top_indices.shape[0]} "
+                f"({'threshold' if threshold_indices is not None else 'ratio'}-based)"
+            )
 
             k, v = k[top_indices], v[top_indices]
             q = q[top_indices]
             residual = residual[top_indices]
-
-            logger.debug(f"Number of indices picked: {len(top_indices)}")
 
             self.metadata.imp_indices = top_indices
             self.metadata.positions = self.metadata.positions[top_indices]
@@ -134,6 +161,7 @@ class LMCBlender:
 
         layerwise_model_executor = self.layerwise_model.compute_layer(tokens)
         layerwise_retriever = self.cache_engine.retrieve_layer(tokens, mask, **kwargs)
+
 
         next(layerwise_retriever)
         yield

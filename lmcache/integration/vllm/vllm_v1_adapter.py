@@ -749,6 +749,7 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -756,12 +757,25 @@ class LMCacheConnectorV1Impl:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
+                    starts = []
+                    ends = []
+                    hash_val = []
+                    for start, end, h in self.lmcache_engine.token_database.process_tokens(
+                        tokens=tokens[:lmcache_cached_tokens],
+                        mask=token_mask[:lmcache_cached_tokens],
+                    ):
+                        starts.append(start)
+                        ends.append(end)
+                        hash_val.append(h)
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        starts = starts,
+                        ends = ends,
+                        hash_val = hash_val,
                     )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(

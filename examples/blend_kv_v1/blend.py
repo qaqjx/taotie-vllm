@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import os
+os.environ["PYTHONHASHSEED"] = "0" 
+
 from dataclasses import asdict
 import argparse
 import contextlib
@@ -146,49 +149,33 @@ def main():
         # Define the shared prompt and specific prompts
         warmup_prompt = tokenizer.encode("Nice to meet you" * 500)[1:]
         sys_prompt = tokenizer.encode("You are a very helpful assistant.")
-        chunk1_prompt = tokenizer.encode("Hello, how are you?" * 500)[1:]
-        chunk2_prompt = tokenizer.encode("Hello, what's up?" * 500)[1:]
-        chunk3_prompt = tokenizer.encode("Hi, what are you up to?" * 500)[1:]
-        blend_special_str = tokenizer.encode(os.getenv("LMCACHE_BLEND_SPECIAL_STR"))[1:]
-        first_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, my name is")[1:]
-        )
+        chunk1 = tokenizer.encode("Hello, how are you doing today? " * 300)[1:]  # ~2000 tokens
+        chunk2 = tokenizer.encode("What's your favorite color? " * 300)[1:]
+        chunk3 = tokenizer.encode("Tell me about yourself. " * 300)[1:]
+        sep = tokenizer.encode(" # #")[1:]
+        question1 = tokenizer.encode("Please help me")[1:]
+        question2 = tokenizer.encode("What do you think?")[1:]
+        question3 = tokenizer.encode("Can you assist?")[1:]
 
-        second_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, how are you?")[1:]
-        )
+        prompt1 = sys_prompt + sep + chunk1 + sep + chunk2 + sep + chunk3 + sep + question1
+        prompt2 = sys_prompt + sep + chunk2 + sep + chunk1 + sep + chunk3 + sep + question2
+        prompt3 = sys_prompt + sep + chunk3 + sep + chunk1 + sep + chunk2 + sep + question3
 
-        third_prompt = (
-            sys_prompt
-            + blend_special_str
-            + chunk3_prompt
-            + blend_special_str
-            + chunk1_prompt
-            + blend_special_str
-            + chunk2_prompt
-            + blend_special_str
-            + tokenizer.encode("Hello, what's up?")[1:]
-        )
-
+        first_prompt = prompt1
+        second_prompt = prompt2
+        third_prompt = prompt3
+        # print("system length:", len(sys_prompt))
+        # print("separator length:", len(sep))
+        # print(f"chunk 1: {len(chunk1)} tokens, chunk 2: {len(chunk2)} tokens, chunk 3: {len(chunk3)} tokens")
+        # print(f"first prompt length: {len(first_prompt)}, second prompt length: {len(second_prompt)}, third prompt length: {len(third_prompt)}")
+        # return
         sampling_params = SamplingParams(temperature=0, top_p=0.95, max_tokens=1)
 
         print_output(llm, warmup_prompt, sampling_params, "warmup")
+
+        # print_output(llm, chunk1, sampling_params, "chunk1-only")
+        # print_output(llm, chunk2, sampling_params, "chunk2-only")
+        # print_output(llm, chunk3, sampling_params, "chunk3-only")
 
         # Print the first output
         print_output(llm, first_prompt, sampling_params, "first")

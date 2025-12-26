@@ -8,6 +8,7 @@ from torch import nn
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.compute.blend.blender import LMCBlender
+from lmcache.v1.compute.blend.taotie_blender import TaoTieCBlender
 from lmcache.v1.compute.models.utils import VLLMModelTracker
 
 if TYPE_CHECKING:
@@ -37,7 +38,7 @@ class LMCBlenderBuilder:
         if instance_id not in cls._blenders:
             logger.info(f"Creating blender for {instance_id}")
             vllm_model = VLLMModelTracker.get_model(instance_id)
-            blender = LMCBlender(
+            blender = TaoTieCBlender(
                 cache_engine=cache_engine,
                 gpu_connector=gpu_connector,
                 vllm_model=vllm_model,

@@ -329,13 +329,19 @@ class SegmentTokenDatabase(TokenDatabase):
             (windows == self.sep_tokens).all(dim=1).nonzero(as_tuple=True)[0].tolist()
         )
 
+        if len(matches) <= 1:
+            yield 0, len(tokens), tokens
+            return
         # Split based on matches
-        start = 0
-        for idx in matches:
-            yield tokens[start:idx]
-            start = idx + self.sep_len
+
+
+        for idx in range(0, len(matches) , 2):
+            start = matches[idx] + self.sep_len
+            end = matches[idx + 1] 
+            yield start , end , tokens[start:end]
+
         # yield last chunk
-        yield tokens[start:]
+        # yield tokens[start:]
 
     def process_tokens(
         self,
@@ -389,24 +395,26 @@ class SegmentTokenDatabase(TokenDatabase):
 
             token_chunks = self._fast_split_by_subtensor(tokens)
             start_idx = 0
-            for idx, token_chunk in enumerate(token_chunks):
-                token_chunk_len = len(token_chunk)
-                end_idx = start_idx + token_chunk_len
-                if idx > 0:
-                    start_idx += self.sep_len
-                    end_idx += self.sep_len
-                if start_idx >= num_falses:
-                    if make_key:
-                        yield (
-                            start_idx,
-                            end_idx,
-                            self._make_key_by_hash(
-                                self._hash_tokens(token_chunk), request_configs
-                            ),
-                        )
-                    else:
-                        yield start_idx, end_idx, self._hash_tokens(token_chunk)
-                start_idx = end_idx
+            num_chunks = 0
+            chunk_hashes = []  # DEBUG: Track hashes
+            for idx, (start, end, chunk) in enumerate(token_chunks):
+                num_chunks += 1
+                chunk_hash = self._hash_tokens(chunk)
+               
+                if make_key:
+                    yield (
+                        start,
+                        end,
+                        self._make_key_by_hash(
+                            chunk_hash, request_configs
+                        ),
+                    )
+                else:
+                    yield start, end, chunk_hash
+            # DEBUG: Log segment details
+            if num_chunks > 1:
+                logger.info(f"SegmentTokenDatabase: Split {len(tokens)} tokens into {num_chunks} segments. "
+                           f"Segment sizes and hashes: {[(s, hex(h)[-8:]) for s, h in chunk_hashes]}")
         elif hashes is not None:
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
