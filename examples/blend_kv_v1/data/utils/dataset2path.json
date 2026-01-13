@@ -1,0 +1,15 @@
+{
+  "wikimqa": "dataset/wikimqa_s.jsonl",
+  "samsum": "dataset/samsum.jsonl",
+  "musique": "dataset/musique_s.jsonl",
+  
+  "repobench-p": "dataset/repobench-p.jsonl",
+  "needle-single": "dataset/needle_single.jsonl",
+  "needle-multi": "dataset/needle_multi.jsonl",
+
+  "multinews": "dataset/multi_news.jsonl",
+  "triviaqa": "dataset/triviaqa.jsonl",
+
+  "dureader": "dataset/dureader_s.jsonl",
+  "hotpotqa": "dataset/hotpotqa_s.jsonl"
+}

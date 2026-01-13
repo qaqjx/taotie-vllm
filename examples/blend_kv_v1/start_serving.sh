@@ -21,7 +21,7 @@ export LMCACHE_MAX_LOCAL_CPU_SIZE=5
 # export LMCACHE_MAX_LOCAL_DISK_SIZE=10
 
 # 模型配置
-MODEL=${MODEL:-"mistralai/Mistral-7B-Instruct-v0.2"}
+MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}
 PORT=${PORT:-8000}
 GPU_MEM=${GPU_MEM:-0.6}
 MAX_LEN=${MAX_LEN:-32000}
@@ -46,4 +46,5 @@ vllm serve "$MODEL" \
   --max-model-len "$MAX_LEN" \
   --no-enable-prefix-caching \
   --no-enable-chunked-prefill \
-  --enforce-eager
+  --enforce-eager \
+  -tp 1

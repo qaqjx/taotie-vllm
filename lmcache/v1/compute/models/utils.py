@@ -18,6 +18,10 @@ def infer_model_from_vllm(vllm_model, blender, enable_sparse: bool = False):
         # First Party
 
         return TaoTieLMCLlamaModel(vllm_model, blender, enable_sparse)
+    elif model_name == "Qwen2ForCausalLM":
+        # First Party
+        return TaoTieLMCLlamaModel(vllm_model, blender, enable_sparse)
+
     else:
         # TODO(Jiayi): Add support for more models
         raise NotImplementedError(
