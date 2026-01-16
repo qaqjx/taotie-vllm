@@ -11,7 +11,7 @@ import lmcache.c_ops as lmc_ops
 from lmcache.v1.compute.blend.Cacheblend import CacheBlend
 from lmcache.v1.compute.blend.kvmanager import KVCacheManager
 
-store_kvcache_dir = "kvcache/"
+store_kvcache_dir = "vllm/kvcache/"
 
 def get_kvcache_filename(hash_str : str, layer_idx = -1, device = "cuda:0"):
 
@@ -109,14 +109,54 @@ class ContextManager:
             return
 
         kv = torch.cat(self.kv[layer_idx], dim=0).contiguous().reshape(2, -1, self.num_heads_kv * self.head_dim)
-        lmc_ops.single_layer_kv_transfer(
-            kv,
-            kvcaches[layer_idx],
-            slot_mapping,
-            True,
-            False,
-            (kvcaches[0].shape[0] == 2)
-        )
+
+        # Get KV cache capacity (num_blocks * block_size)
+        # kvcaches shape: [2, num_blocks, block_size, num_heads, head_dim]
+        kv_capacity = kvcaches[layer_idx].shape[1] * kvcaches[layer_idx].shape[2]
+        kv_len = kv.shape[1]
+        slot_len = slot_mapping.shape[0]
+
+        # Debug: print lengths and slot_mapping range
+        if layer_idx == 0:
+            slot_min = slot_mapping.min().item() if slot_len > 0 else -1
+            slot_max = slot_mapping.max().item() if slot_len > 0 else -1
+            print(f"[_transfer_page] layer={layer_idx}, kv.shape={kv.shape}, kvcaches.shape={kvcaches[layer_idx].shape}, slot_len={slot_len}, slot_range=[{slot_min}, {slot_max}]", flush=True)
+
+        # Truncate to minimum length if mismatched
+        if kv_len != slot_len:
+            min_len = min(kv_len, slot_len)
+            kv = kv[:, :min_len, :]
+            slot_mapping = slot_mapping[:min_len]
+
+        # Filter out-of-bounds slot indices
+        valid_mask = slot_mapping < kv_capacity
+        if not valid_mask.all():
+            valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+            if layer_idx == 0:
+                print(f"[_transfer_page] Filtering {slot_len - valid_indices.shape[0]} out-of-bounds slots", flush=True)
+            slot_mapping = slot_mapping[valid_indices]
+            kv = kv[:, valid_indices, :]
+
+        if kv.shape[1] == 0:
+            self.kv[layer_idx] = None
+            return
+
+        try:
+            lmc_ops.single_layer_kv_transfer(
+                kv,
+                kvcaches[layer_idx],
+                slot_mapping,
+                False,
+                False,
+                (kvcaches[0].shape[0] == 2)
+            )
+            torch.cuda.synchronize()
+        except Exception as e:
+            print(f"[_transfer_page] ERROR in single_layer_kv_transfer: {e}", flush=True)
+            print(f"[_transfer_page] kv.dtype={kv.dtype}, kv.device={kv.device}", flush=True)
+            print(f"[_transfer_page] kvcaches.dtype={kvcaches[layer_idx].dtype}, kvcaches.device={kvcaches[layer_idx].device}", flush=True)
+            print(f"[_transfer_page] slot_mapping.dtype={slot_mapping.dtype}, slot_mapping.device={slot_mapping.device}", flush=True)
+            raise
         self.kv[layer_idx] = None
 
     def init(self, query , key):
@@ -176,6 +216,9 @@ class ContextManager:
                 }
                 for _ in range(self.layer_num)
             ]
+            
+            logger.info(f"ContextManager: Initializing all_reuse_cache for {self.all_reuse_cache[0]['key'].shape} layers.")
+
             self.compress_data = [None for _ in range(self.layer_num) ]
             self.indices = indices
 

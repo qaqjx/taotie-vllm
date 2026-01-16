@@ -89,7 +89,7 @@ class KVCacheManager:
         device="cuda",
         shape=None,
         max_buffer_size=16 * 1024 * 1024 * 1024,
-        compress_type=CompressType.OURS,
+        compress_type=CompressType.NONE,
         compress_config=None,
         io_config: Optional[Dict[str, Any]] = None,
     ):

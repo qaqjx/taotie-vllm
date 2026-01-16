@@ -117,6 +117,9 @@ class TaoTieCBlender:
 
         index = [(start , end) for start , end in zip(kwargs.get("starts", []) , kwargs.get("ends", [])) ]
 
+        # Debug: print blend info
+        print(f"[blend] tokens_len={len(tokens)}, flag={flag}, starts={kwargs.get('starts', [])}, ends={kwargs.get('ends', [])}", flush=True)
+
         hash_text = []
         for idx in index:
             token_chunk = tokens[idx[0]:idx[1]]
@@ -124,10 +127,10 @@ class TaoTieCBlender:
             hash_text.append("wordl_size" +  str(kwargs.get("hash_val")[0].world_size) + actual_hash)
 
         blend_meta = {
-            "context_manager": self.context_manager, 
-            "gpu_connector": self.gpu_connector, 
-            "kvcaches": kvcaches, 
-            "slot_mapping": slot_mapping, 
+            "context_manager": self.context_manager,
+            "gpu_connector": self.gpu_connector,
+            "kvcaches": kvcaches,
+            "slot_mapping": slot_mapping,
             "flag": flag,
             "hash_text": hash_text,
             "indices": index,
@@ -141,10 +144,10 @@ class TaoTieCBlender:
 
         if blend_meta["state"] == "store":
             blend_meta["hash_text"] = blend_meta["hash_text"][0]
-            print(f"Storing KV cache into TaoTie backend {blend_meta['hash_text']}")
-        else:
-            print(f"index mapping {blend_meta['indices']}")
-            print(f"retrieving KV cache from TaoTie backend {blend_meta['hash_text']}")
+            # print(f"Storing KV cache into TaoTie backend {blend_meta['hash_text']}")
+        # else:
+            # print(f"index mapping {blend_meta['indices']}")
+            # print(f"retrieving KV cache from TaoTie backend {blend_meta['hash_text']}")
         self.blend_layer(tokens, mask, blend_meta, **kwargs)
 
 

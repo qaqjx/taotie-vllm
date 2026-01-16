@@ -1,5 +1,5 @@
 #!/bin/bash
-CUDA_VISIBLE_DEVICES=1
+
 # CacheBlend Serving启动脚本
 
 # 设置LMCache环境变量
@@ -21,8 +21,8 @@ export LMCACHE_MAX_LOCAL_CPU_SIZE=5
 # export LMCACHE_MAX_LOCAL_DISK_SIZE=10
 
 # 模型配置
-MODEL=${MODEL:-"mistralai/Mistral-7B-Instruct-v0.3"}
-PORT=${PORT:-12345}
+MODEL=${MODEL:-"Qwen/Qwen2.5-7B-Instruct"}
+PORT=${PORT:-8000}
 GPU_MEM=${GPU_MEM:-0.6}
 MAX_LEN=${MAX_LEN:-32000}
 
@@ -39,7 +39,7 @@ echo "Special String: '$LMCACHE_BLEND_SPECIAL_STR'"
 echo "=========================================="
 
 # 启动vLLM serving
-CUDA_VISIBLE_DEVICES=0 vllm serve "$MODEL" \
+vllm serve "$MODEL" \
   --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' \
   --port "$PORT" \
   --gpu-memory-utilization "$GPU_MEM" \

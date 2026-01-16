@@ -9,6 +9,7 @@ from pathlib import Path
 from statistics import mean, median
 
 import aiohttp
+from transformers import AutoTokenizer
 
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
@@ -78,11 +79,18 @@ def load_dataset(path, limit=None):
     return samples
 
 
-def build_prompt(sample):
+def build_prompt(sample, tokenizer, sep_tokens):
+    """Build tokenized prompt with separator tokens between contexts."""
     contexts = sample.get("contexts") or []
     question = sample.get("question", "")
-    sections = list(contexts) + [question]
-    return " # # ".join(sections)
+    # 格式: sep + ctx1 + sep + ctx2 + sep + ... + sep + question
+    tokens = []
+    for ctx in contexts:
+        tokens.extend(sep_tokens)
+        tokens.extend(tokenizer.encode(ctx, add_special_tokens=False))
+    tokens.extend(sep_tokens)
+    tokens.extend(tokenizer.encode(question, add_special_tokens=False))
+    return tokens
 
 
 def unique_contexts(samples):
@@ -172,7 +180,13 @@ def print_request_metrics(name, sample, metrics):
     )
 
 
-async def precompute_contexts(session, contexts):
+async def precompute_contexts(session, contexts, tokenizer, sep_tokens):
+    """预热：每个 context 用纯内容 token 发送（不带 separator）。
+
+    原因：SegmentTokenDatabase 分段时返回的是不含分隔符的纯 context，
+    taotie_blender 计算 hash 时也是基于不含分隔符的 tokens[start:end]。
+    因此 warmup 存储时也必须用纯 context 内容，hash 才能匹配。
+    """
     total = len(contexts)
     if total == 0:
         print("无需预计算：无可用上下文。")
@@ -181,18 +195,21 @@ async def precompute_contexts(session, contexts):
     print(f"开始预计算contexts，总计{total}条unique contexts")
     print("=" * 60)
     for idx, ctx in enumerate(contexts, start=1):
+        # 只发送纯 context 内容（不含分隔符），与检索时的 hash 计算方式一致
+        tokens = tokenizer.encode(ctx, add_special_tokens=False)
+
         request_name = f"[预热 {idx}/{total}]"
-        print(f"{request_name} 开始")
-        await helpers.stream_completion(session=session, prompt=ctx, request_name=request_name)
+        print(f"{request_name} 开始 (tokens={len(tokens)})")
+        await helpers.stream_completion(session=session, prompt=tokens, request_name=request_name)
         print(f"{request_name} 完成")
     print("预计算完成，等待2秒确保服务稳定...")
     await asyncio.sleep(2)
 
 
-async def run_requests(session, samples, request_rate, burstiness):
+async def run_requests(session, samples, request_rate, burstiness, tokenizer, sep_tokens):
     entries = []
     for idx, sample in enumerate(samples, start=1):
-        prompt = build_prompt(sample)
+        prompt = build_prompt(sample, tokenizer, sep_tokens)
         name = f"[样本 {idx}]"
         entries.append((name, prompt, sample))
 
@@ -246,6 +263,11 @@ async def main():
     helpers.api_base = args.api_base
     helpers.model = args.model
 
+    # Initialize tokenizer and separator tokens
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    sep_tokens = tokenizer.encode(" # # ", add_special_tokens=False)
+    print(f"Separator tokens: {sep_tokens}")
+
     samples = load_dataset(args.dataset, args.num_samples)
     if not samples:
         print("未加载到任何样本，退出。")
@@ -266,13 +288,13 @@ async def main():
     async with aiohttp.ClientSession() as session:
         if args.precompute_contexts:
             contexts = unique_contexts(samples)
-            await precompute_contexts(session, contexts)
+            await precompute_contexts(session, contexts, tokenizer, sep_tokens)
 
         print("=" * 60)
         print("开始正式测试")
         print("=" * 60)
         results = await run_requests(
-            session, samples, args.request_rate, args.burstiness
+            session, samples, args.request_rate, args.burstiness, tokenizer, sep_tokens
         )
 
     print()

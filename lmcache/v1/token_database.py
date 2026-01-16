@@ -332,16 +332,15 @@ class SegmentTokenDatabase(TokenDatabase):
         if len(matches) <= 1:
             yield 0, len(tokens), tokens
             return
-        # Split based on matches
 
-
-        for idx in range(0, len(matches) , 2):
+        # Split based on matches: each pair of consecutive separators defines a chunk
+        # sep + chunk1 + sep + chunk2 + sep + chunk3 + sep
+        # matches: [m0, m1, m2, m3] -> chunks: [m0+sep_len, m1], [m1+sep_len, m2], [m2+sep_len, m3]
+        for idx in range(len(matches) - 1):
             start = matches[idx] + self.sep_len
-            end = matches[idx + 1] 
-            yield start , end , tokens[start:end]
-
-        # yield last chunk
-        # yield tokens[start:]
+            end = matches[idx + 1]
+            if end > start:
+                yield start, end, tokens[start:end]
 
     def process_tokens(
         self,
@@ -394,10 +393,8 @@ class SegmentTokenDatabase(TokenDatabase):
             )
 
             token_chunks = self._fast_split_by_subtensor(tokens)
-            start_idx = 0
             num_chunks = 0
-            chunk_hashes = []  # DEBUG: Track hashes
-            for idx, (start, end, chunk) in enumerate(token_chunks):
+            for start, end, chunk in token_chunks:
                 num_chunks += 1
                 chunk_hash = self._hash_tokens(chunk)
                
@@ -413,8 +410,7 @@ class SegmentTokenDatabase(TokenDatabase):
                     yield start, end, chunk_hash
             # DEBUG: Log segment details
             if num_chunks > 1:
-                logger.info(f"SegmentTokenDatabase: Split {len(tokens)} tokens into {num_chunks} segments. "
-                           f"Segment sizes and hashes: {[(s, hex(h)[-8:]) for s, h in chunk_hashes]}")
+                logger.info(f"SegmentTokenDatabase: Split {len(tokens)} tokens into {num_chunks} segments.")
         elif hashes is not None:
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."

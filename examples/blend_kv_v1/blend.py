@@ -72,9 +72,10 @@ def build_llm_with_lmcache(lmcache_connector: str, model: str):
         model=model,
         kv_transfer_config=ktc,
         max_model_len=32648,
-        gpu_memory_utilization=0.8,
+        gpu_memory_utilization=0.65,
         enable_prefix_caching=False,
         enforce_eager=True,
+        tensor_parallel_size=1,
     )
 
     llm = LLM(**asdict(llm_args))

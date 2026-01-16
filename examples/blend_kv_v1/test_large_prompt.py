@@ -11,8 +11,8 @@ import numpy as np
 from transformers import AutoTokenizer
 
 
-api_base = "http://localhost:8000"
-model = "mistralai/Mistral-7B-Instruct-v0.2"
+api_base = "http://localhost:12345"
+model = "mistralai/Mistral-7B-Instruct-v0.3"
 
 
 def parse_args():
@@ -61,7 +61,7 @@ async def stream_completion(session, prompt, request_name):
     payload = {
         "model": model,
         "prompt": prompt,
-        "max_tokens": 5,
+        "max_tokens": 64,
         "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
