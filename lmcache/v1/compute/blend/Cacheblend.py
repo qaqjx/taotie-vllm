@@ -47,9 +47,6 @@ class CacheBlend():
 
     key_or_value = "value"
     
-    # positions = torch.arange(0, query.size(1), device=self.device)
-    # retrieve_key, key = self.rope(retrieve_key, key, positions.unsqueeze(0).expand(query.size(0), -1))
-    
     target, ref = (value, retrieve_value) if key_or_value == "value" else (key, retrieve_key)
     deviation = self.calc_deviation(target, ref)
       # Set the value deviation to 0 for tokens that are not reused

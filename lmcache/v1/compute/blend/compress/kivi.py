@@ -336,7 +336,7 @@ class Kivi2Bit(AbstractCompress):
         config = config or {}
         self.residual_length = 32
         self.group_size = 32
-        self.num_bits = 2
+        self.num_bits = 4
         # print("Using KIVI 2-bit compression with residual length:", self.residual_length)
 
     def compress(self, data , score = None,layer_idx=None, ) -> dict:
@@ -363,11 +363,11 @@ class Kivi2Bit(AbstractCompress):
         value = value[:, residual_length: , ::]
 
         key_quantized , key_min , key_range = triton_quantize_and_pack_along_last_dim(
-            key , self.group_size , 2
+            key , self.group_size , self.num_bits
         )
 
         value_quantized , value_min , value_range = triton_quantize_and_pack_along_last_dim(
-            value , self.group_size , 2
+            value , self.group_size , self.num_bits
         )
        
         dict = {
@@ -421,8 +421,8 @@ class Kivi2Bit(AbstractCompress):
         value_min = compressed_data["value_min"]
         value_range = compressed_data["value_range"]
 
-        key = unpack_and_dequant_vcache(key_quantized, key_min.unsqueeze(-1), key_range.unsqueeze(-1), self.group_size, 2)
-        value = unpack_and_dequant_vcache(value_quantized, value_min.unsqueeze(-1), value_range.unsqueeze(-1), self.group_size, 2)
+        key = unpack_and_dequant_vcache(key_quantized, key_min.unsqueeze(-1), key_range.unsqueeze(-1), self.group_size, self.num_bits)
+        value = unpack_and_dequant_vcache(value_quantized, value_min.unsqueeze(-1), value_range.unsqueeze(-1), self.group_size, self.num_bits)
 
         key = key.permute(0, 3, 1, 2).contiguous()
 
@@ -430,10 +430,12 @@ class Kivi2Bit(AbstractCompress):
         if "key_residual" in compressed_data and "value_residual" in compressed_data:
             key_residual = compressed_data["key_residual"]
             value_residual = compressed_data["value_residual"]
+            # print(f"[KIVI decompress] key_residual.shape={key_residual.shape}", flush=True)
 
             key = torch.cat([key_residual, key], dim=1)
             value = torch.cat([value_residual, value], dim=1)
-  
+
+        # print(f"[KIVI decompress] final: key.shape={key.shape}, value.shape={value.shape}, expected kv_len={kv_len}", flush=True)
 
         # print(f"key sum {torch.sum(key)} , value sum {torch.sum(value)}")
         assert key.shape == value.shape, "Key and value shapes do not match after decompression"

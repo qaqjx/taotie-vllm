@@ -1,6 +1,7 @@
 from asyncio.log import logger
 import os
 import threading
+import time
 from sympy import sequence
 import torch
 import torch.distributed as dist
@@ -9,13 +10,31 @@ import flashinfer
 import lmcache.c_ops as lmc_ops
 
 from lmcache.v1.compute.blend.Cacheblend import CacheBlend
-from lmcache.v1.compute.blend.kvmanager import KVCacheManager
+from lmcache.v1.compute.blend.compress.abstract import CompressType
+from lmcache.v1.compute.blend.kvmanager import KVCacheManager, profile_log
 
 store_kvcache_dir = "vllm/kvcache/"
 
-def get_kvcache_filename(hash_str : str, layer_idx = -1, device = "cuda:0"):
 
-    filename = os.path.join(store_kvcache_dir, str(hash_str) + "-layer_" + str(layer_idx) + "-device_" + str(device) + ".bin")
+def _get_env_compress_type_name() -> str:
+    """
+    Read compression type from env and normalize to uppercase for consistent paths.
+    """
+    return os.environ.get("LMCACHE_COMPRESS_TYPE", "KIVI_2BIT").upper()
+
+
+def get_kvcache_filename(
+    hash_str: str,
+    layer_idx: int = -1,
+    device: str = "cuda:0",
+    compress_type: Optional[str] = None,
+):
+    compress_type = _get_env_compress_type_name() if compress_type is None else str(compress_type).upper()
+    filename = os.path.join(
+        store_kvcache_dir,
+        compress_type,
+        f"{hash_str}-layer_{layer_idx}-device_{device}.bin",
+    )
     return filename
 
 class AdaptiveKVCacheAttention:
@@ -83,6 +102,7 @@ class ContextManager:
         self.initialized = False
         self.device = device
         self.layer_num = layer_num
+        self.compress_type = _get_env_compress_type_name()
         self.phase = "prefill"
         self.shape = (self.batch_size , 1 , self.num_heads_kv , self.head_dim) 
         self.kv_manager = KVCacheManager.get_instance(shape = self.shape ,layer_num = self.layer_num , device=self.device)
@@ -120,7 +140,6 @@ class ContextManager:
         if layer_idx == 0:
             slot_min = slot_mapping.min().item() if slot_len > 0 else -1
             slot_max = slot_mapping.max().item() if slot_len > 0 else -1
-            print(f"[_transfer_page] layer={layer_idx}, kv.shape={kv.shape}, kvcaches.shape={kvcaches[layer_idx].shape}, slot_len={slot_len}, slot_range=[{slot_min}, {slot_max}]", flush=True)
 
         # Truncate to minimum length if mismatched
         if kv_len != slot_len:
@@ -132,8 +151,6 @@ class ContextManager:
         valid_mask = slot_mapping < kv_capacity
         if not valid_mask.all():
             valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-            if layer_idx == 0:
-                print(f"[_transfer_page] Filtering {slot_len - valid_indices.shape[0]} out-of-bounds slots", flush=True)
             slot_mapping = slot_mapping[valid_indices]
             kv = kv[:, valid_indices, :]
 
@@ -141,26 +158,18 @@ class ContextManager:
             self.kv[layer_idx] = None
             return
 
-        try:
-            lmc_ops.single_layer_kv_transfer(
-                kv,
-                kvcaches[layer_idx],
-                slot_mapping,
-                False,
-                False,
-                (kvcaches[0].shape[0] == 2)
-            )
-            torch.cuda.synchronize()
-        except Exception as e:
-            print(f"[_transfer_page] ERROR in single_layer_kv_transfer: {e}", flush=True)
-            print(f"[_transfer_page] kv.dtype={kv.dtype}, kv.device={kv.device}", flush=True)
-            print(f"[_transfer_page] kvcaches.dtype={kvcaches[layer_idx].dtype}, kvcaches.device={kvcaches[layer_idx].device}", flush=True)
-            print(f"[_transfer_page] slot_mapping.dtype={slot_mapping.dtype}, slot_mapping.device={slot_mapping.device}", flush=True)
-            raise
+        lmc_ops.single_layer_kv_transfer(
+            kv,
+            kvcaches[layer_idx],
+            slot_mapping,
+            False,
+            False,
+            (kvcaches[0].shape[0] == 2)
+        )
+    
         self.kv[layer_idx] = None
 
     def init(self, query , key):
-        logger.info(f"ContextManager: Initializing with query and key shapes. Query shape: {query.shape}, Key shape: {key.shape}")
         assert query.dim() == 4
         batch_size, _, num_heads, head_dim = query.shape
 
@@ -184,7 +193,17 @@ class ContextManager:
         """ 
 
         for idx , kv in enumerate(self.kv):
-            self.kv_manager.store_data(get_kvcache_filename(text_hash, layer_idx=idx ,device=self.device), kv, scores , layer_idx=idx)
+            self.kv_manager.store_data(
+                get_kvcache_filename(
+                    text_hash,
+                    layer_idx=idx,
+                    device=self.device,
+                    compress_type=self.compress_type,
+                ),
+                kv,
+                scores,
+                layer_idx=idx,
+            )
  
     def store_chunks_kv(self, store_text_hashs: List , store_indices: List, layer_idx: int):
 
@@ -195,7 +214,12 @@ class ContextManager:
 
             # slice the chunk kv cache
             self.kv_manager.offload_compress_data(
-                get_kvcache_filename(text_hash , layer_idx=layer_idx , device=self.device),
+                get_kvcache_filename(
+                    text_hash,
+                    layer_idx=layer_idx,
+                    device=self.device,
+                    compress_type=self.compress_type,
+                ),
                 (key, value)
             )
 
@@ -209,6 +233,7 @@ class ContextManager:
             return
 
         if layer_idx == 1:
+            alloc_start = time.perf_counter()
             self.all_reuse_cache = [
                 {
                     "key": torch.zeros((self.batch_size, kv_len, self.num_heads_kv * self.head_dim), dtype=self.dtype, device=self.device),
@@ -221,29 +246,67 @@ class ContextManager:
 
             self.compress_data = [None for _ in range(self.layer_num) ]
             self.indices = indices
+            alloc_end = time.perf_counter()
+            profile_log(f"prefetch_chunk_kv: allocated reuse cache for {self.layer_num} layers took {(alloc_end - alloc_start) * 1000:.2f}ms")
 
+        retrieve_start = time.perf_counter()
         self.compress_data[layer_idx] = self.kv_manager.retrieve_keys(
             [
-                get_kvcache_filename(text , layer_idx=layer_idx , device=self.device)
+                get_kvcache_filename(
+                    text,
+                    layer_idx=layer_idx,
+                    device=self.device,
+                    compress_type=self.compress_type,
+                )
                     for text in text_hash
             ]
         )
+        retrieve_end = time.perf_counter()
+        profile_log(
+            f"prefetch_chunk_kv: retrieve_keys for layer {layer_idx} ({len(text_hash)} hashes) took {(retrieve_end - retrieve_start) * 1000:.2f}ms"
+        )
+
+        if self.kv_manager.compress_type != CompressType.OURS:
+            self.compress_data[layer_idx] = self.kv_manager.retrieve_by_task_id(task_id=self.compress_data[layer_idx])
+
 
     def get_reuse_kv(self, layer_idx: int):
         if self.reuse_kv_finished[layer_idx]:
+            profile_log(f"get_reuse_kv: layer {layer_idx} already prepared, skipping.")
             return
 
         if not isinstance(self.compress_data[layer_idx], list):
+            retrieve_task_start = time.perf_counter()
             self.compress_data[layer_idx] = self.kv_manager.retrieve_by_task_id(task_id=self.compress_data[layer_idx])
+            retrieve_task_end = time.perf_counter()
+            profile_log(
+                f"get_reuse_kv: retrieve_by_task_id for layer {layer_idx} took {(retrieve_task_end - retrieve_task_start) * 1000:.2f}ms"
+            )
 
+        decompress_time = 0.0
+        copy_time = 0.0
         for idx , compressed_data in enumerate(self.compress_data[layer_idx]):
+            decompress_start = time.perf_counter()
             key , value = self.kv_manager.compressor.decompress(compressed_data, kv_len=self.indices[idx][1] - self.indices[idx][0])
+            decompress_time += time.perf_counter() - decompress_start
 
+            copy_start = time.perf_counter()
             self.all_reuse_cache[layer_idx]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(key.reshape(self.all_reuse_cache[layer_idx]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
             self.all_reuse_cache[layer_idx]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(value.reshape(self.all_reuse_cache[layer_idx]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
+            copy_time += time.perf_counter() - copy_start
 
+        profile_log(
+            f"get_reuse_kv: layer {layer_idx} decompressed {len(self.compress_data[layer_idx])} chunks in {decompress_time * 1000:.2f}ms "
+            f"and copied to buffers in {copy_time * 1000:.2f}ms"
+        )
+
+        reshape_start = time.perf_counter()
         self.all_reuse_cache[layer_idx]["key"] = self.all_reuse_cache[layer_idx]["key"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
         self.all_reuse_cache[layer_idx]["value"] = self.all_reuse_cache[layer_idx]["value"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
+        reshape_end = time.perf_counter()
+        profile_log(
+            f"get_reuse_kv: reshape and finalize buffers for layer {layer_idx} took {(reshape_end - reshape_start) * 1000:.2f}ms"
+        )
 
         self.compress_data[layer_idx] = None
 
@@ -281,7 +344,12 @@ class ContextManager:
         
         if blend_meta["state"] == "store":
             self.kv_manager.store_data(
-                get_kvcache_filename(blend_meta["hash_text"], layer_idx=layer_idx , device=self.device),
+                get_kvcache_filename(
+                    blend_meta["hash_text"],
+                    layer_idx=layer_idx,
+                    device=self.device,
+                    compress_type=self.compress_type,
+                ),
                 (pre_rope_key , value),
                 layer_idx=layer_idx
             )
@@ -328,7 +396,6 @@ class ContextManager:
             )
         )
 
-        # print(f"Layer {layer_idx} recompute {recomputed_idx.size(0)}/{query.size(1)} tokens.")
         # step 3: compute the attention
         o = self.prefill(query, key, value, layer_idx ,blend_meta)
 

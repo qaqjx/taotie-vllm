@@ -15,7 +15,7 @@ except ImportError as e:
 class S3DiskManager():
     """Disk IO manager backed by the S3/MinIO C++ extension."""
 
-    MAX_TASK_THREADS = 16
+    MAX_TASK_THREADS = 64  # Increased from 16 to support concurrent blend requests
 
     def __init__(self, config_path: str = "/home/xujie/TaoTie/csrc/config/s3.ini"):
         """

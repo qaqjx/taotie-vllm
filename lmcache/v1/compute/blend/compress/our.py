@@ -1,9 +1,16 @@
-
-
+import os
 import time
 import torch
 
 from lmcache.v1.compute.blend.compress.abstract import AbstractCompress
+
+# Profiling toggle replicated here to avoid circular imports.
+ENABLE_PROFILING = os.environ.get("LMCACHE_ENABLE_PROFILING", "0") == "1"
+
+
+def profile_log(msg: str):
+    if ENABLE_PROFILING:
+        print(f"[PROFILE] {msg}", flush=True)
 
 def calculate_elbow(singular_value: torch.Tensor) -> float:
     """
@@ -78,8 +85,25 @@ class UniformAllocate():
 class Ours(AbstractCompress):
     def __init__(self, device="cuda", config: dict = None):
         super().__init__(device=device)
-        self.ratio = 0.05
+        self.ratio = 0.1
         self.last_final_ranks = None
+
+    def _sync_if_needed(self):
+        if not ENABLE_PROFILING or not torch.cuda.is_available():
+            return
+        device = self.device
+        if isinstance(device, torch.device):
+            if device.type != "cuda":
+                return
+        elif isinstance(device, str):
+            if not device.startswith("cuda"):
+                return
+            device = torch.device(device)
+        elif isinstance(device, int):
+            pass
+        else:
+            return
+        torch.cuda.synchronize(device=device)
 
     def sq_compress(self, data) -> dict:
         u , v = data
@@ -122,9 +146,6 @@ class Ours(AbstractCompress):
         residual_key_sv = v[:split_dim,:self.key_residual_dim,:]
         residual_value_sv = v[split_dim:,:self.value_residual_dim,:]
 
-        residual_key_u = u[:split_dim,:self.key_residual_dim,:]
-        residual_value_u = u[split_dim:,:self.value_residual_dim,:]
-
         return {
             f"u_quantized": u_quantized.cpu().contiguous(),
             f"u_meta": u_meta.cpu(),
@@ -146,8 +167,6 @@ class Ours(AbstractCompress):
         v_meta = compressed_data[f"v_meta"]
         residual_key_v = compressed_data[f"key_residual_sv"]
         residual_value_v = compressed_data[f"value_residual_sv"]
-        # residual_key_u = compressed_data[f"key_residual_u"]
-        # residual_value_u = compressed_data[f"value_residual_u"]
 
         u_0 = u_quantized // 16
         u_1 = u_quantized % 16
@@ -167,14 +186,9 @@ class Ours(AbstractCompress):
 
         residual_key_v_dim = min(v_dequantized.size(1), residual_key_v.size(1))
         residual_value_v_dim = min(v_dequantized.size(1), residual_value_v.size(1))
-        # residual_key_u_dim = min(u_dequantized.size(1), residual_key_u.size(1))
-        # residual_value_u_dim = min(u_dequantized.size(1), residual_value_u.size(1))
-
+ 
         v_dequantized[:split_dim, :residual_key_v_dim, :] = residual_key_v[: ,:residual_key_v_dim, :]
         v_dequantized[split_dim:, :residual_value_v_dim, :] = residual_value_v[: ,:residual_value_v_dim, :]
-
-        # u_dequantized[:split_dim, :residual_key_u_dim, :] = residual_key_u[: ,:residual_key_u_dim, :]
-        # u_dequantized[split_dim:, :residual_value_u_dim, :] = residual_value_u[: ,:residual_value_u_dim, :]
 
         return u_dequantized, v_dequantized
 
@@ -230,15 +244,6 @@ class Ours(AbstractCompress):
                 dim=head_dim * num_heads,
                 token_num=seq_len
             )[0]
-            # final_ranks = DynamicAllocate().allocate(
-            #     total_budget_bytes=total_original_mem_bytes * (len(scores) - 1) ,
-            #     num_layers=(len(scores) - 1),
-            #     dim=head_dim * num_heads,
-            #     token_num=seq_len,
-            #     score=scores,
-            #     max_rank=min(head_dim * num_heads, seq_len)
-            # )
-            # final_ranks  = final_ranks[layer_idx - 1]
 
         max_residual_rank = max(final_ranks - 1, 0)
         self.key_residual_dim = min(key_residual_dim, max_residual_rank)
@@ -257,6 +262,8 @@ class Ours(AbstractCompress):
         return data
     
     def transfer(self, compressed_data):
+        self._sync_if_needed()
+        transfer_start = time.perf_counter()
         compressed_data[f"u_quantized"] = compressed_data[f"u_quantized"].to(self.device, non_blocking=True)
         compressed_data[f"u_meta"] = compressed_data[f"u_meta"].to(self.device, non_blocking=True)
 
@@ -265,15 +272,21 @@ class Ours(AbstractCompress):
 
         compressed_data[f"key_residual_sv"] = compressed_data[f"key_residual_sv"].to(self.device, non_blocking=True)
         compressed_data[f"value_residual_sv"] = compressed_data[f"value_residual_sv"].to(self.device, non_blocking=True)
+        self._sync_if_needed()
+        transfer_end = time.perf_counter()
+        profile_log(
+            f"Ours.transfer: moved {len(compressed_data)} tensors to {self.device} in {(transfer_end - transfer_start) * 1000:.2f}ms"
+        )
 
-        # compressed_data[f"key_residual_u"] = compressed_data[f"key_residual_u"].to(self.device, non_blocking=True)
-        # compressed_data[f"value_residual_u"] = compressed_data[f"value_residual_u"].to(self.device, non_blocking=True)
         return compressed_data
 
     def decompress(self, compressed_data , kv_len):
+        sq_start = time.perf_counter()
         u , sv = self.sq_decompress(compressed_data, kv_len)
-
+        
+        matmul_start = time.perf_counter()
         u = u.transpose(-1, -2).contiguous()
         kv = torch.matmul(u , sv)
+       
 
         return kv[0] , kv[1]
