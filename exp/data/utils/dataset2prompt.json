@@ -1,0 +1,15 @@
+{
+  "wikimqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Answer the question within 5 words. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+  "musique": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Answer the question within 5 words. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+  "samsum": "Summarize the dialogue into a few short sentences. The following are some examples.\n\n{context}\n\n{input}\nSummary:",
+
+  "repobench-p": "Please complete the code given below. \n{context}{input}Next line of code:\n",
+  "needle-single": "Answer the question based on the given documents . Only give me the answer and do not output any other words.\n\nThe following are given documents.\n{context}\n\nAnswer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+  "needle-multi": "Answer the question based on the given documents . Only give me the answer and do not output any other words.\n\nThe following are given documents.\n{context}\n\nAnswer the question based on the given documents. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:",
+
+  "multi_news": "You are given several news passages. Write a one-page summary of all news. \n\nNews:\n{context}\n\nNow, write a one-page summary of all the news.\n\nSummary:",
+  "triviaqa": "Answer the question based on the given passage. Only give me the answer and do not output any other words. The following are some examples.\n\n{context}\n\n{input}",
+
+  "dureader": "请基于给定的文章回答下述问题。\n\n文章：{context}\n\n请基于上述文章回答下面的问题。\n\n问题：{input}\n回答：",
+  "hotpotqa": "Answer the question based on the given passages. Only give me the answer and do not output any other words.\n\nThe following are given passages.\n{context}\n\nAnswer the question based on the given passages. Only give me the answer and do not output any other words.\n\nQuestion: {input}\nAnswer:"
+}

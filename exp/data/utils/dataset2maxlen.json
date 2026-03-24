@@ -1,0 +1,15 @@
+{
+  "wikimqa": 32,
+  "musique": 32,
+  "samsum": 128,
+
+  "repobench-p": 64,
+  "needle-single": 64,
+  "needle-multi": 64,
+
+  "multi_news": 400,
+  "triviaqa": 32,
+
+  "dureader": 128,
+  "hotpotqa": 32
+}

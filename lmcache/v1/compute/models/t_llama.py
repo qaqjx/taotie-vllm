@@ -6,7 +6,7 @@ from torch import nn
 import torch
 
 # First Party
-from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
+# from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
 from lmcache.v1.compute.positional_encoding import get_fused_rope
 
 # TODO(Jiayi): A few things need to be tested/supported:
@@ -31,9 +31,9 @@ class TaoTieLMCLlamaModel(nn.Module):
             vllm_attn = vllm_model.model.layers[i].self_attn.attn
             self.vllm_attn_layers.append(vllm_attn)
 
-            self.lmc_attn_layers.append(
-                infer_attn_backend_from_vllm(vllm_attn, enable_sparse)
-            )
+            # self.lmc_attn_layers.append(
+            #     infer_attn_backend_from_vllm(vllm_attn, enable_sparse)
+            # )
 
         # NOTE(Jiayi): better not to pass the blender in init
         # if we want to make this LMCModel more general.
