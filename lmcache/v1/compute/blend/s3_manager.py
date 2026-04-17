@@ -17,7 +17,7 @@ class S3DiskManager():
 
     MAX_TASK_THREADS = 64  # Increased from 16 to support concurrent blend requests
 
-    def __init__(self, config_path: str = "/home/xujie/TaoTie/csrc/config/s3.ini"):
+    def __init__(self, config_path: str = "/home/xujie/xj_project/config/s3.ini"):
         """
         Initialize S3DiskManager.
 
@@ -65,6 +65,17 @@ class S3DiskManager():
         """
         # Use S3Manager.save() directly for synchronous save
         self._manager.save(key, data)
+
+    def save_data_async(
+        self, key: str, data: Dict[str, torch.Tensor], compress_flag: bool = False
+    ) -> int:
+        """
+        Submit an asynchronous save task to the S3 scheduler.
+
+        Returns:
+            Task ID for checking readiness or waiting via `wait()`.
+        """
+        return self._backend.submit_save(key, data)
 
     def _get_device_index(self, device: Union[str, torch.device]) -> int:
         """Extract CUDA device index from device specification."""

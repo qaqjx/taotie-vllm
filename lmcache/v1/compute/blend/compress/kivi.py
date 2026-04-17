@@ -4,7 +4,9 @@ import torch
 import torch
 
 from lmcache.v1.compute.blend.compress.abstract import AbstractCompress
-
+def profile_log(msg: str, *args, **kwargs):
+    print(f"[PROFILE] {msg}", flush=True)
+        
 def quantized_last_dim(tensor, num_bits):
     """
     Quantizes the last dimension of the tensor to the specified number of bits.
@@ -344,6 +346,7 @@ class Kivi2Bit(AbstractCompress):
         Compress the given data using 2-bit.
         """
         key, value = data
+        profile_log(f"[KIVI compress] key.shape={key.shape} , value.shape={value.shape} , score={score} , layer_idx={layer_idx}", flush=True)
         assert key.device != "cpu", "2-bit compression only supports CUDA tensors"
         if key.size(1) < self.residual_length + 1:
             return {

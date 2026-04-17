@@ -177,7 +177,7 @@ def main(model_name: str):
     tokens_in_offload_cache = int(
         cpu_offload_GiB_per_gpu * (1 / GiB_1K_tokens_per_gpu) * 1000
     )
-    print(f"Total tokens storable: {tokens_in_offload_cache}")
+    print(f"*.pystorable: {tokens_in_offload_cache}")
 
     print_vllm_deployment_string(model_name, tp)
     print_lmcache_deployment_string(model_name, tp, cpu_offload_GiB_per_gpu)

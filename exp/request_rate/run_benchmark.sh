@@ -1,23 +1,25 @@
 #!/bin/bash
-# 统一 benchmark 脚本：测试不同压缩方法在不同 request rate 下的 TTFT
+# 统一 benchmark 脚本：测试不同压缩方法在不同 request rate 下的首包/首choice延迟
 
 set -e
 
 # ============== 配置参数 ==============
 GPU=${GPU:-0}
 PORT=${PORT:-12345}
-MODEL="Qwen/Qwen2.5-14B-Instruct"
+MODEL="mistralai/Mistral-7B-Instruct-v0.3"
 METHODS=${METHODS:-"NONE,KIVI_2BIT,OURS,SVDQ"}
-RATES=${RATES:-"1,2,4,8,16"}
-NUM_CONTEXTS=${NUM_CONTEXTS:-10}
-NUM_REQUESTS=${NUM_REQUESTS:-20}
-CTX_PER_REQ=${CTX_PER_REQ:-"2,3"}
+RATES=${RATES:-"0.1, 0.2 , 0.3 , 0.4 ,0.5,1, 1.5 ,2,4"}
+NUM_CONTEXTS=${NUM_CONTEXTS:-20}
+NUM_REQUESTS=${NUM_REQUESTS:-10}
+CTX_PER_REQ=${CTX_PER_REQ:-"2,5"}
 TARGET_LENGTH=${TARGET_LENGTH:-""}
 WARMUP_DELAY=${WARMUP_DELAY:-20}
 ROUNDS=${ROUNDS:-1}
 MATCH_RATE=${MATCH_RATE:-""}
 OUTPUT_DIR="$(dirname $0)/results"
 LOG_DIR="$(dirname $0)/server_logs"
+PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
+VLLM_EXE=${VLLM_EXE:-$(dirname "$PYTHON_BIN")/vllm}
 
 # ============== 辅助函数 ==============
 log() {
@@ -32,6 +34,7 @@ kill_server() {
 }
 start_server() {
     local method=$1
+    local log_file="$LOG_DIR/vllm_${method}_${PORT}.log"
     log "Starting server with COMPRESS_TYPE=${method}..."
 
     export CUDA_VISIBLE_DEVICES=$GPU
@@ -46,22 +49,45 @@ start_server() {
     export LMCACHE_BLEND_MIN_TOKENS=64
     export LMCACHE_LOCAL_CPU=True
     export LMCACHE_MAX_LOCAL_CPU_SIZE=5
+    export LMCACHE_ENABLE_PROFILING=${LMCACHE_ENABLE_PROFILING:-1}
 
     mkdir -p "$LOG_DIR"
 
-    vllm serve "$MODEL" \
+    "$VLLM_EXE" serve "$MODEL" \
         --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' \
         --port $PORT \
         --gpu-memory-utilization 0.8 \
         --max-model-len 32000 \
-        --no-enable-prefix-caching \
-        --no-enable-chunked-prefill \
         --enforce-eager \
         -tp 1 \
-        > "$LOG_DIR/vllm_${method}_${PORT}.log" 2>&1 &
+        > "$log_file" 2>&1 &
 
     SERVER_PID=$!
     log "Server PID: $SERVER_PID"
+    log "Server log: $log_file"
+}
+
+inspect_server_config() {
+    local method=$1
+    local log_file="$LOG_DIR/vllm_${method}_${PORT}.log"
+
+    if [ ! -f "$log_file" ]; then
+        return 0
+    fi
+
+    local config_line
+    config_line=$(grep -m1 "enable_prefix_caching=" "$log_file" || true)
+    if [ -n "$config_line" ]; then
+        log "Effective vLLM config: $config_line"
+        if echo "$config_line" | grep -q "enable_prefix_caching=True"; then
+            log "WARNING: prefix caching is enabled in current vLLM runtime."
+        fi
+        if echo "$config_line" | grep -q "chunked_prefill_enabled=True"; then
+            log "WARNING: chunked prefill is enabled in current vLLM runtime."
+        fi
+    else
+        log "WARNING: Could not find effective prefix/chunked-prefill config in server log yet."
+    fi
 }
 
 wait_server() {
@@ -99,6 +125,7 @@ run_benchmark() {
     python3 "$(dirname $0)/bench_reuse.py" \
         --model "$MODEL" \
         --port $PORT \
+        --server-log "$LOG_DIR/vllm_${method}_${PORT}.log" \
         --methods "$method" \
         --rates "$RATES" \
         --num-contexts $NUM_CONTEXTS \
@@ -117,6 +144,8 @@ main() {
     log "=============================================="
     log "GPU: $GPU"
     log "Port: $PORT"
+    log "Python: $PYTHON_BIN"
+    log "vLLM: $VLLM_EXE"
     log "Methods: $METHODS"
     log "Rates: $RATES"
     log "Contexts: $NUM_CONTEXTS"
@@ -147,6 +176,7 @@ main() {
             log "Skipping $method due to server startup failure"
             continue
         fi
+        inspect_server_config "$method"
 
         # 4. 运行 benchmark
         run_benchmark "$method"

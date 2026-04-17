@@ -3,7 +3,10 @@
 import argparse
 import asyncio
 import json
+import os
+import re
 import time
+from pathlib import Path
 from statistics import mean, median
 
 import aiohttp
@@ -13,6 +16,9 @@ from transformers import AutoTokenizer
 
 api_base = "http://localhost:12345"
 model = "mistralai/Mistral-7B-Instruct-v0.3"
+server_profile_log_path = os.environ.get("LMCACHE_SERVER_PROFILE_LOG")
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def parse_args():
@@ -29,11 +35,154 @@ def parse_args():
         default=1.0,
         help="Burstiness factor. 1.0 corresponds to a Poisson process.",
     )
+    parser.add_argument(
+        "--server-log",
+        type=str,
+        default=server_profile_log_path,
+        help="Optional vLLM server log path used to extract server-side profile metrics.",
+    )
     return parser.parse_args()
 
 
 def _format_ms(value):
     return f"{value * 1000:.2f} ms" if value is not None else "N/A"
+
+
+def _sum_profile_metric(lines, pattern):
+    total = 0.0
+    for line in lines:
+        match = re.search(pattern, line)
+        if match:
+            total += float(match.group(1))
+    return total
+
+
+def _last_profile_metric(lines, pattern):
+    value = None
+    for line in lines:
+        match = re.search(pattern, line)
+        if match:
+            value = float(match.group(1))
+    return value
+
+
+def _extract_server_profile(lines, request_id: str):
+    matching_indices = [
+        index
+        for index, line in enumerate(lines)
+        if "[PROFILE]" in line and request_id in line
+    ]
+    if not matching_indices:
+        return None
+
+    start_index = matching_indices[0]
+    end_index = None
+    for index in range(start_index, len(lines)):
+        line = lines[index]
+        if "[PROFILE]" not in line:
+            continue
+        if index > start_index and "scheduler.lookup:" in line and request_id not in line:
+            end_index = index
+            break
+        if "start_load_kv: all requests total took" in line:
+            end_index = index + 1
+            break
+
+    block = lines[start_index:end_index]
+    if not block:
+        return None
+
+    retrieve_db_ms = _sum_profile_metric(
+        block, r"retrieve_by_task_id: db\.retrive_by_task took ([0-9.]+)ms"
+    )
+    retrieve_transfer_ms = _sum_profile_metric(
+        block, r"retrieve_by_task_id: transfer \d+ items took ([0-9.]+)ms"
+    )
+    decompress_ms = 0.0
+    copy_ms = 0.0
+    for line in block:
+        match = re.search(
+            r"get_reuse_kv: layer \d+ decompressed \d+ chunks in ([0-9.]+)ms "
+            r"and copied to buffers in ([0-9.]+)ms",
+            line,
+        )
+        if match:
+            decompress_ms += float(match.group(1))
+            copy_ms += float(match.group(2))
+    blend_forward_ms = _sum_profile_metric(
+        block,
+        r"prefill_select_token: layer=\d+ get_reuse_kv=[0-9.]+ms "
+        r"blend_forward=([0-9.]+)ms",
+    )
+
+    def _last_profile_metric_for_request(pattern):
+        value = None
+        for line in lines:
+            if request_id not in line:
+                continue
+            match = re.search(pattern, line)
+            if match:
+                value = float(match.group(1))
+        return value
+
+    return {
+        "request_id": request_id,
+        "server_true_ttft_ms": _last_profile_metric_for_request(
+            r"true_server_ttft: req=.* arrival_to_first_token=([0-9.]+)ms",
+        ),
+        "server_blender_done_ms": _last_profile_metric_for_request(
+            r"arrival_to_first_blender_done: req=.* ([0-9.]+)ms",
+        ),
+        "server_queue_ms": _last_profile_metric_for_request(
+            r"true_server_ttft: req=.* queue=([0-9.]+)ms",
+        ),
+        "server_prefill_ms": _last_profile_metric_for_request(
+            r"true_server_ttft: req=.* prefill=([0-9.]+)ms",
+        ),
+        "scheduler_lookup_ms": _last_profile_metric(
+            block, r"scheduler\.lookup: .* took ([0-9.]+)ms"
+        ),
+        "build_connector_meta_ms": _last_profile_metric(
+            block, r"build_connector_meta: .* took ([0-9.]+)ms"
+        ),
+        "process_tokens_ms": _last_profile_metric(
+            block,
+            r"start_load_kv: req=.* process_tokens .* took ([0-9.]+)ms",
+        ),
+        "server_blend_envelope_ms": _last_profile_metric(
+            block,
+            r"start_load_kv: req=.* blender\.blend total took ([0-9.]+)ms",
+        ),
+        "server_load_path_ms": _last_profile_metric(
+            block,
+            r"start_load_kv: req=.* total load-path took ([0-9.]+)ms",
+        ),
+        "server_blend_core_ms": (
+            retrieve_db_ms + retrieve_transfer_ms + decompress_ms + copy_ms + blend_forward_ms
+        ),
+        "retrieve_by_task_db_ms": retrieve_db_ms,
+        "retrieve_by_task_transfer_ms": retrieve_transfer_ms,
+        "decompress_ms": decompress_ms,
+        "copy_ms": copy_ms,
+        "blend_forward_ms": blend_forward_ms,
+    }
+
+
+async def maybe_collect_server_profile(request_id: str | None, wait_timeout: float = 3.0):
+    if not request_id or not server_profile_log_path:
+        return None
+
+    log_path = Path(server_profile_log_path)
+    deadline = time.perf_counter() + wait_timeout
+    while time.perf_counter() < deadline:
+        if log_path.exists():
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [_ANSI_ESCAPE_RE.sub("", line.rstrip()) for line in f]
+            profile = _extract_server_profile(lines, request_id)
+            if profile is not None:
+                return profile
+        await asyncio.sleep(0.1)
+    return None
 
 
 async def send_requests_with_rate_limit(prompts, request_rate, burstiness):
@@ -76,6 +225,8 @@ async def stream_completion(session, prompt, request_name):
     ) as response:
         response.raise_for_status()
         print(f"{request_name} Response received, streaming...")
+        response_headers_time = time.perf_counter()
+        first_chunk_time = None
         first_token_time = None
         most_recent_timestamp = start_time
         generated_chunks = []
@@ -83,6 +234,7 @@ async def stream_completion(session, prompt, request_name):
         prompt_tokens = None
         completion_tokens = None
         success = False
+        request_id = response.headers.get("x-request-id")
         buffer = ""
         done = False
         async for raw_chunk in response.content:
@@ -101,6 +253,9 @@ async def stream_completion(session, prompt, request_name):
                     done = True
                     break
                 chunk = json.loads(data)
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter()
+                request_id = chunk.get("id") or request_id
                 choices = chunk.get("choices")
                 usage = chunk.get("usage")
                 if choices:
@@ -120,16 +275,30 @@ async def stream_completion(session, prompt, request_name):
                     )
             if done:
                 break
-    ttft = first_token_time - start_time if first_token_time is not None else None
+    response_headers_latency = (
+        response_headers_time - start_time if response_headers_time is not None else None
+    )
+    first_chunk_latency = (
+        first_chunk_time - start_time if first_chunk_time is not None else None
+    )
+    first_choice_latency = (
+        first_token_time - start_time if first_token_time is not None else None
+    )
     latency = most_recent_timestamp - start_time
+    server_profile = await maybe_collect_server_profile(request_id)
     metrics = {
         "generated_text": "".join(generated_chunks),
-        "ttft": ttft,
+        "ttft": first_choice_latency,
+        "response_headers_latency": response_headers_latency,
+        "first_chunk_latency": first_chunk_latency,
+        "first_choice_latency": first_choice_latency,
         "itl": itl,
         "latency": latency,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "success": success,
+        "request_id": request_id,
+        "server_profile": server_profile,
     }
     return metrics
 
@@ -138,7 +307,9 @@ def print_metrics(metrics):
     print(metrics["generated_text"])
     if not metrics["success"]:
         print("警告: 未收到任何含choices的chunk，以下指标可能无效。")
-    print(f"TTFT: {_format_ms(metrics['ttft'])}")
+    print(f"Headers latency: {_format_ms(metrics.get('response_headers_latency'))}")
+    print(f"First chunk latency: {_format_ms(metrics.get('first_chunk_latency'))}")
+    print(f"First choice latency: {_format_ms(metrics.get('first_choice_latency'))}")
     if metrics["itl"]:
         mean_itl = mean(metrics["itl"])
         median_itl = median(metrics["itl"])
@@ -156,10 +327,21 @@ def print_metrics(metrics):
     print(
         f"Prompt tokens: {prompt_tokens_str} | Completion tokens: {completion_tokens_str}"
     )
+    server_profile = metrics.get("server_profile")
+    if server_profile:
+        print(
+            "Server profile: "
+            f"true TTFT={server_profile.get('server_true_ttft_ms', 0.0):.2f} ms, "
+            f"arrival->blender={server_profile.get('server_blender_done_ms', 0.0):.2f} ms, "
+            f"blend envelope={server_profile.get('server_blend_envelope_ms', 0.0):.2f} ms, "
+            f"blend core={server_profile.get('server_blend_core_ms', 0.0):.2f} ms"
+        )
 
 
 async def main():
     args = parse_args()
+    global server_profile_log_path
+    server_profile_log_path = args.server_log
     tokenizer = AutoTokenizer.from_pretrained(model)
 
     # 更大的chunks - 每个约2000 tokens

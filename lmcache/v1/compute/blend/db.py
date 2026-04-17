@@ -28,6 +28,17 @@ class DataCenter:
         self.disk_io_manager = S3DiskManager()
         self.cpu_buffer_pool = CPUBufferPool(max_size=max_buffer_size)
         self.device = device
+        self.pending_save_tasks: Dict[str, int] = {}
+
+    def _wait_pending_save(self, key: str):
+        task_id = self.pending_save_tasks.pop(key, None)
+        if task_id is None:
+            return
+        self.disk_io_manager.wait(task_id)
+
+    def wait_pending_saves(self):
+        for key in list(self.pending_save_tasks):
+            self._wait_pending_save(key)
 
     def retrieve_data(self, key: str):
         """
@@ -38,6 +49,7 @@ class DataCenter:
             return data
         
         if data is None:
+            self._wait_pending_save(key)
             data = self.disk_io_manager.load_data(key)
             if data is not None:
                 self.cpu_buffer_pool.add_data(key, data)
@@ -53,7 +65,8 @@ class DataCenter:
         # disk_keys = [keys[i] for i in range(len(keys)) if result[i] is None]
         # if disk_keys == []:
         #     return result
-
+        for key in keys:
+            self._wait_pending_save(key)
         task_id = self.disk_io_manager.load_datas(keys, self.device) 
         # for i, key in enumerate(disk_keys):
         #     if disk_result_cpu[i] is not None:
@@ -72,16 +85,24 @@ class DataCenter:
         result = self.disk_io_manager.load_task(task_id)
         return result
 
-    def store_data(self, key: str, data , compress_flag=False):
+    def store_data(self, key: str, data , compress_flag=False, async_disk_save: bool = False):
         """
         Save data to a file.
         """
         self.cpu_buffer_pool.add_data(key, data)
 
         if self.offload_mode == OffloadMode.DISK:
-            self.disk_io_manager.save_data(key, data, compress_flag=compress_flag)
+            if async_disk_save:
+                self.pending_save_tasks[key] = self.disk_io_manager.save_data_async(
+                    key,
+                    data,
+                    compress_flag=compress_flag,
+                )
+            else:
+                self.disk_io_manager.save_data(key, data, compress_flag=compress_flag)
 
         return True
     
     def clean(self):
+        self.wait_pending_saves()
         self.cpu_buffer_pool.clean()

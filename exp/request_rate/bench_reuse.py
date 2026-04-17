@@ -38,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET)
+    parser.add_argument(
+        "--server-log",
+        type=str,
+        default=os.environ.get("LMCACHE_SERVER_PROFILE_LOG"),
+        help="Optional vLLM server log path used to extract server-side profile metrics.",
+    )
     parser.add_argument("--methods", type=str, default="OURS,KIVI_2BIT")
     parser.add_argument("--num-contexts", type=int, default=10)
     parser.add_argument("--num-requests", type=int, default=10)
@@ -200,8 +206,47 @@ def summarize(values: List[float]) -> dict:
 
 
 def aggregate_records(records: List[dict]) -> dict:
+    headers_latencies = [
+        r["response_headers_latency"]
+        for r in records
+        if r.get("response_headers_latency") is not None
+    ]
+    first_chunk_latencies = [
+        r["first_chunk_latency"]
+        for r in records
+        if r.get("first_chunk_latency") is not None
+    ]
+    first_choice_latencies = [
+        r["first_choice_latency"]
+        for r in records
+        if r.get("first_choice_latency") is not None
+    ]
     ttfts = [r["ttft"] for r in records if r["ttft"] is not None]
     latencies = [r["latency"] for r in records if r["latency"] is not None]
+    server_blend_envelope = [
+        (r["server_profile"]["server_blend_envelope_ms"] / 1000.0)
+        for r in records
+        if r.get("server_profile")
+        and r["server_profile"].get("server_blend_envelope_ms") is not None
+    ]
+    server_true_ttft = [
+        (r["server_profile"]["server_true_ttft_ms"] / 1000.0)
+        for r in records
+        if r.get("server_profile")
+        and r["server_profile"].get("server_true_ttft_ms") is not None
+    ]
+    server_blender_done = [
+        (r["server_profile"]["server_blender_done_ms"] / 1000.0)
+        for r in records
+        if r.get("server_profile")
+        and r["server_profile"].get("server_blender_done_ms") is not None
+    ]
+    server_blend_core = [
+        (r["server_profile"]["server_blend_core_ms"] / 1000.0)
+        for r in records
+        if r.get("server_profile")
+        and r["server_profile"].get("server_blend_core_ms") is not None
+    ]
     itls: List[float] = []
     for r in records:
         itls.extend(r.get("itl") or [])
@@ -213,8 +258,15 @@ def aggregate_records(records: List[dict]) -> dict:
     request_count = len(records)
     return {
         "request_count": request_count,
+        "headers_latency": summarize(headers_latencies),
+        "first_chunk_latency": summarize(first_chunk_latencies),
+        "first_choice_latency": summarize(first_choice_latencies),
         "ttft": summarize(ttfts),
         "latency": summarize(latencies),
+        "server_true_ttft": summarize(server_true_ttft),
+        "server_blender_done": summarize(server_blender_done),
+        "server_blend_envelope": summarize(server_blend_envelope),
+        "server_blend_core": summarize(server_blend_core),
         "itl": summarize(itls),
         "prompt_tokens": summarize(prompt_tokens),
         "completion_tokens": summarize(completion_tokens),
@@ -353,10 +405,14 @@ async def run_requests_for_rate(
                 {
                     **base,
                     "ttft": None,
+                    "response_headers_latency": None,
+                    "first_chunk_latency": None,
+                    "first_choice_latency": None,
                     "latency": None,
                     "itl": [],
                     "prompt_tokens": None,
                     "completion_tokens": None,
+                    "server_profile": None,
                     "success": False,
                 }
             )
@@ -365,10 +421,14 @@ async def run_requests_for_rate(
                 {
                     **base,
                     "ttft": result.get("ttft"),
+                    "response_headers_latency": result.get("response_headers_latency"),
+                    "first_chunk_latency": result.get("first_chunk_latency"),
+                    "first_choice_latency": result.get("first_choice_latency"),
                     "latency": result.get("latency"),
                     "itl": result.get("itl") or [],
                     "prompt_tokens": result.get("prompt_tokens"),
                     "completion_tokens": result.get("completion_tokens"),
+                    "server_profile": result.get("server_profile"),
                     "success": result.get("success", False),
                 }
             )
@@ -381,14 +441,26 @@ def print_rate_summary(method: str, rate: float, summary: dict) -> None:
     success_rate = summary.get("success_rate")
     req_count = summary.get("request_count", 0)
     success_pct = f"{success_rate * 100:.1f}%" if success_rate is not None else "N/A"
-    ttft_stats = summary.get("ttft", {})
+    headers_stats = summary.get("headers_latency", {})
+    first_chunk_stats = summary.get("first_chunk_latency", {})
+    first_choice_stats = summary.get("first_choice_latency", {})
+    server_true_ttft = summary.get("server_true_ttft", {})
+    server_blender_done = summary.get("server_blender_done", {})
+    server_blend_envelope = summary.get("server_blend_envelope", {})
+    server_blend_core = summary.get("server_blend_core", {})
     print(f"[{method}] Rate={rate_str} RPS over {req_count} requests:")
     print(
-        f"  TTFT avg={format_ms(ttft_stats.get('avg'))}, "
-        f"p50={format_ms(ttft_stats.get('p50'))}, "
-        f"p90={format_ms(ttft_stats.get('p90'))}, "
-        f"p99={format_ms(ttft_stats.get('p99'))}"
+        f"  Headers avg={format_ms(headers_stats.get('avg'))}, "
+        f"FirstChunk avg={format_ms(first_chunk_stats.get('avg'))}, "
+        f"FirstChoice avg={format_ms(first_choice_stats.get('avg'))}"
     )
+    if server_blend_envelope.get("avg") is not None:
+        print(
+            f"  Server trueTTFT avg={format_ms(server_true_ttft.get('avg'))}, "
+            f"arrival->blender avg={format_ms(server_blender_done.get('avg'))}, "
+            f"blend envelope avg={format_ms(server_blend_envelope.get('avg'))}, "
+            f"blend core avg={format_ms(server_blend_core.get('avg'))}"
+        )
     print(f"  Success rate: {success_pct}")
 
 
@@ -401,15 +473,25 @@ def build_summary_rows(
         for rate in sorted(rate_dict.keys(), key=lambda x: float("inf") if math.isinf(x) else x):
             data = rate_dict[rate]
             summary = data["summary"]
-            ttft = summary["ttft"]
+            first_choice = summary["first_choice_latency"]
+            headers = summary["headers_latency"]
+            first_chunk = summary["first_chunk_latency"]
+            server_true_ttft = summary["server_true_ttft"]
+            server_blender_done = summary["server_blender_done"]
+            server_blend_core = summary["server_blend_core"]
             rows.append(
                 {
                     "method": method,
                     "rate": _format_rate(rate),
-                    "avg": ttft["avg"],
-                    "p50": ttft["p50"],
-                    "p90": ttft["p90"],
-                    "p99": ttft["p99"],
+                    "headers_avg": headers["avg"],
+                    "first_chunk_avg": first_chunk["avg"],
+                    "avg": first_choice["avg"],
+                    "p50": first_choice["p50"],
+                    "p90": first_choice["p90"],
+                    "p99": first_choice["p99"],
+                    "server_true_ttft_avg": server_true_ttft["avg"],
+                    "server_blender_done_avg": server_blender_done["avg"],
+                    "server_blend_core_avg": server_blend_core["avg"],
                     "success_rate": summary.get("success_rate"),
                 }
             )
@@ -420,8 +502,8 @@ def print_final_table(rows: List[dict]) -> None:
     if not rows:
         return
     header = (
-        f"{'Method':<12}{'Rate':>8}{'TTFT(avg)':>16}"
-        f"{'P50':>12}{'P90':>12}{'P99':>12}{'Success':>12}"
+        f"{'Method':<12}{'Rate':>8}{'Headers':>12}{'1stChunk':>12}"
+        f"{'1stChoice':>12}{'SrvTTFT':>12}{'->Blend':>12}{'Success':>12}"
     )
     print("\n" + "=" * len(header))
     print("Final Summary")
@@ -434,10 +516,11 @@ def print_final_table(rows: List[dict]) -> None:
         print(
             f"{row['method']:<12}"
             f"{row['rate']:>8}"
-            f"{format_ms(row['avg']):>16}"
-            f"{format_ms(row['p50']):>12}"
-            f"{format_ms(row['p90']):>12}"
-            f"{format_ms(row['p99']):>12}"
+            f"{format_ms(row['headers_avg']):>12}"
+            f"{format_ms(row['first_chunk_avg']):>12}"
+            f"{format_ms(row['avg']):>12}"
+            f"{format_ms(row['server_true_ttft_avg']):>12}"
+            f"{format_ms(row['server_blender_done_avg']):>12}"
             f"{success_str:>12}"
         )
     print("-" * len(header))
@@ -525,6 +608,7 @@ async def main_async() -> None:
     args = parse_args()
     helpers.model = args.model
     helpers.api_base = f"http://localhost:{args.port}"
+    helpers.server_profile_log_path = args.server_log
 
     methods = parse_methods(args.methods)
     rates = parse_rates(args.rates)

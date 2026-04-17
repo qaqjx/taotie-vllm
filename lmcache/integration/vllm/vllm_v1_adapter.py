@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 import uuid
 
 # Third Party
@@ -66,6 +67,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+ENABLE_PROFILING = os.environ.get("LMCACHE_ENABLE_PROFILING", "0") == "1"
+
+
+def profile_log(msg: str) -> None:
+    if ENABLE_PROFILING:
+        print(f"[PROFILE] {msg}", flush=True)
+
 
 @dataclass
 class LoadSpec:
@@ -115,6 +123,9 @@ class RequestTracker:
 
     # Total prompt token length
     prompt_len: int
+
+    # Request arrival time (frontend wall-clock)
+    arrival_time: float
 
     # The token ids that has been scheduled so far
     token_ids: list[int]
@@ -199,6 +210,7 @@ class RequestTracker:
         return RequestTracker(
             req_id=new_request.req_id,
             prompt_len=len(new_request.prompt_token_ids),
+            arrival_time=getattr(new_request, "arrival_time", 0.0),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
             num_saved_tokens=lmcache_cached_tokens,
@@ -248,6 +260,8 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
+    # Request arrival time
+    arrival_time: float
     # Slot mapping
     slot_mapping: torch.Tensor
 
@@ -383,6 +397,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
+            arrival_time=tracker.arrival_time,
             slot_mapping=slot_mapping,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
@@ -701,6 +716,7 @@ class LMCacheConnectorV1Impl:
             The number of elements in kv_caches and layer_names should be
             the same.
         """
+        overall_start = time.perf_counter()
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -733,6 +749,7 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
+            request_start = time.perf_counter()
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.cuda()
             assert len(tokens) == len(slot_mapping)
@@ -757,17 +774,26 @@ class LMCacheConnectorV1Impl:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
                 if self.enable_blending:
+                    process_tokens_start = time.perf_counter()
                     starts = []
                     ends = []
                     hash_val = []
                     for start, end, h in self.lmcache_engine.token_database.process_tokens(
                         tokens=tokens[:lmcache_cached_tokens],
                         mask=token_mask[:lmcache_cached_tokens],
-                    ):
+                        ):
                         starts.append(start)
                         ends.append(end)
                         hash_val.append(h)
+                    process_tokens_end = time.perf_counter()
+                    profile_log(
+                        "start_load_kv: "
+                        f"req={request.req_id} process_tokens "
+                        f"{lmcache_cached_tokens} tokens / {len(starts)} segments "
+                        f"took {(process_tokens_end - process_tokens_start) * 1000:.2f}ms"
+                    )
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
+                    blend_start = time.perf_counter()
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
@@ -777,6 +803,18 @@ class LMCacheConnectorV1Impl:
                         ends = ends,
                         hash_val = hash_val,
                     )
+                    blend_end = time.perf_counter()
+                    profile_log(
+                        "start_load_kv: "
+                        f"req={request.req_id} blender.blend total took "
+                        f"{(blend_end - blend_start) * 1000:.2f}ms"
+                    )
+                    if getattr(request, "arrival_time", 0.0):
+                        profile_log(
+                            "arrival_to_first_blender_done: "
+                            f"req={request.req_id} "
+                            f"{(time.time() - request.arrival_time) * 1000:.2f}ms"
+                        )
                 else:
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
@@ -814,6 +852,14 @@ class LMCacheConnectorV1Impl:
                         num_retrieved_tokens,
                         num_expected_tokens,
                     )
+            profile_log(
+                "start_load_kv: "
+                f"req={request.req_id} total load-path took "
+                f"{(time.perf_counter() - request_start) * 1000:.2f}ms"
+            )
+        profile_log(
+            f"start_load_kv: all requests total took {(time.perf_counter() - overall_start) * 1000:.2f}ms"
+        )
 
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -1097,15 +1143,22 @@ class LMCacheConnectorV1Impl:
 
         self._lookup_requests_in_step.append(lookup_id)
 
+        lookup_start = time.perf_counter()
         num_external_hit_tokens = self.lookup_client.lookup(
             token_ids,
             lookup_id=lookup_id,
             request_configs=request_configs,
         )
+        lookup_end = time.perf_counter()
+        profile_log(
+            "scheduler.lookup: "
+            f"req={request.request_id} prompt_tokens={len(token_ids)} "
+            f"took {(lookup_end - lookup_start) * 1000:.2f}ms"
+        )
 
         if num_external_hit_tokens is None:
             logger.info(
-                "Reqid: %s, Total tokens %d, LMCache hit tokens: None.",
+                "Reqid: %s, *.py%d, LMCache hit tokens: None.",
                 request.request_id,
                 request.num_tokens,
             )
@@ -1122,7 +1175,7 @@ class LMCacheConnectorV1Impl:
             need_to_allocate -= 1
 
         logger.info(
-            "Reqid: %s, Total tokens %d, LMCache hit tokens: %d, need to load: %d",
+            "Reqid: %s, *.py%d, LMCache hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
@@ -1222,6 +1275,7 @@ class LMCacheConnectorV1Impl:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
 
+        meta_start = time.perf_counter()
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
@@ -1290,6 +1344,13 @@ class LMCacheConnectorV1Impl:
                 )
                 if req_meta is not None:
                     meta.add_request(req_meta)
+            profile_log(
+                "build_connector_meta: "
+                f"new={len(scheduler_output.scheduled_new_reqs)} "
+                f"cached={len(cached_reqs)} "
+                f"meta_requests={len(meta.requests)} "
+                f"took {(time.perf_counter() - meta_start) * 1000:.2f}ms"
+            )
             return meta
 
         for i, req_id in enumerate(cached_reqs.req_ids):
@@ -1319,6 +1380,14 @@ class LMCacheConnectorV1Impl:
             )
             if req_meta is not None:
                 meta.add_request(req_meta)
+
+        profile_log(
+            "build_connector_meta: "
+            f"new={len(scheduler_output.scheduled_new_reqs)} "
+            f"cached={len(cached_reqs.req_ids)} "
+            f"meta_requests={len(meta.requests)} "
+            f"took {(time.perf_counter() - meta_start) * 1000:.2f}ms"
+        )
 
         return meta
 

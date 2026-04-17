@@ -212,7 +212,7 @@ class LMCacheLookupServer:
                     )
                 result = len(tokens) 
                 response = result.to_bytes(4, "big") 
-                logger.info(f"Cache hit number: {result} for lookup_id: {lookup_id}")
+                # logger.info(f"Cache hit number: {result} for lookup_id: {lookup_id}")
                 self.socket.send(response)
 
         logger.info(f"lmcache lookup server start on {socket_path}")

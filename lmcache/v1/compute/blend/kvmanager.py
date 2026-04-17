@@ -1,5 +1,6 @@
 from asyncio.log import logger
-from multiprocessing.pool import ThreadPool
+from concurrent.futures import Future
+import queue
 import os
 import threading
 import time
@@ -12,7 +13,7 @@ from lmcache.v1.compute.blend.compress.abstract import CompressType
 # Profiling toggle
 ENABLE_PROFILING = os.environ.get("LMCACHE_ENABLE_PROFILING", "0") == "1"
 
-def profile_log(msg: str):
+def profile_log(msg: str, *args, **kwargs):
     if ENABLE_PROFILING:
         print(f"[PROFILE] {msg}", flush=True)
 
@@ -31,16 +32,20 @@ def get_compress_type_from_env() -> CompressType:
         "SVDQ": CompressType.SVDQ,
     }
     if env_value in compress_map:
-        logger.info(f"[KVCacheManager] Using compress type from env: {env_value}")
+        profile_log(f"[KVCacheManager] Using compress type from env: {env_value}")
         return compress_map[env_value]
     else:
-        logger.warning(f"[KVCacheManager] Unknown compress type '{env_value}', using KIVI_2BIT")
+        profile_log(f"[KVCacheManager] Unknown compress type '{env_value}', using KIVI_2BIT")
         return CompressType.KIVI_2BIT
 from lmcache.v1.compute.blend.compress.kivi import Kivi2Bit
 from lmcache.v1.compute.blend.compress.normal import Normal
 from lmcache.v1.compute.blend.compress.our import Ours
 from lmcache.v1.compute.blend.compress.svdq import SVDQ
 from lmcache.v1.compute.blend.db import DataCenter
+from lmcache.v1.compute.blend.xj_project_adapter import (
+    XJProjectAdapterConfig,
+    XJProjectBlendAdapter,
+)
 
 
 
@@ -51,7 +56,7 @@ class CompressFactory:
     @staticmethod
     def create_compressor(compress_type: CompressType, compress_config: dict = None, layer_num : int = 0, device="cuda"):
         compress_config = compress_config or {}
-        
+    
         if compress_type == CompressType.NONE:
             return Normal(device=device, config=compress_config)
         elif compress_type == CompressType.KIVI_2BIT:
@@ -151,12 +156,128 @@ class KVCacheManager:
         self.layer_num = layer_num
         self.compress_config = compress_config or {}
         self.compressor = CompressFactory.create_compressor(compress_type, self.compress_config, layer_num=layer_num , device=self.device)
+        self._xj_adapter = XJProjectBlendAdapter(
+            XJProjectAdapterConfig(
+                enabled=os.environ.get("LMCACHE_USE_XJ_PROJECT", "0") == "1",
+                config_path=self.io_config.get("xj_s3_config")
+                or os.environ.get("LMCACHE_XJ_S3_CONFIG"),
+                ratio=self.compress_config.get("ratio", 0.15),
+                num_workers=self.compress_config.get("num_workers", 4),
+                max_queue_bytes=self.compress_config.get("max_queue_bytes", 0),
+                dtype=self.compress_config.get("dtype", torch.bfloat16),
+                prefetch_workers=self.compress_config.get("prefetch_workers", 16),
+            )
+        )
 
         self.pinned_buffer_allocator = MemoryPinnedBuffer(shape)
         
         self.transfer_stream = torch.cuda.Stream(device=self.device)
 
-        self.keys_set = set()    
+        self.keys_set = set()
+        self._offload_lock = threading.Lock()
+        self._offload_queue: queue.Queue[Any] = queue.Queue()
+        self._offload_worker: Optional[threading.Thread] = None
+        self._pending_offload_futures: List[Future] = []
+
+    def _start_offload_worker(self) -> None:
+        with self._offload_lock:
+            if self._offload_worker is not None and self._offload_worker.is_alive():
+                return
+
+            self._offload_queue = queue.Queue()
+            self._offload_worker = threading.Thread(
+                target=self._offload_worker_loop,
+                name="blend-prefill-offload-worker",
+                daemon=True,
+            )
+            self._offload_worker.start()
+
+    def _drain_completed_offload_futures(self) -> None:
+        still_pending: List[Future] = []
+        for future in self._pending_offload_futures:
+            if future.done():
+                future.result()
+                continue
+            still_pending.append(future)
+        self._pending_offload_futures = still_pending
+
+    def _offload_worker_loop(self) -> None:
+        while True:
+            job = self._offload_queue.get()
+            if job is None:
+                self._offload_queue.task_done()
+                break
+
+            try:
+                key = job["key"]
+                data = job["data"]
+                layer_idx = job["layer_idx"]
+                producer_event = job["producer_event"]
+                future = job["future"]
+
+                sequence_len = data[0].size(1)
+                key_pinned = self.pinned_buffer_allocator.allocate(sequence_len)
+                value_pinned = self.pinned_buffer_allocator.allocate(sequence_len)
+
+                self.transfer_stream.wait_event(producer_event)
+                with torch.cuda.stream(self.transfer_stream):
+                    key_pinned.copy_(data[0], non_blocking=True)
+                    value_pinned.copy_(data[1], non_blocking=True)
+
+                self.transfer_stream.synchronize()
+
+                offloaded_data = {
+                    "key": key_pinned,
+                    "value": value_pinned,
+                }
+                flag = self.db.store_data(
+                    key,
+                    offloaded_data,
+                    compress_flag=True,
+                    async_disk_save=True,
+                )
+
+                if flag and "layer_0" in key:
+                    self.keys_set.add(key.split("/")[-1])
+
+                future.set_result(flag)
+            except Exception as e:
+                logger.exception("Async prefill offload worker failed")
+                future.set_exception(e)
+            finally:
+                self._offload_queue.task_done()
+
+    def flush_pending_offloads(self) -> None:
+        for future in list(self._pending_offload_futures):
+            future.result()
+        self._pending_offload_futures = []
+
+    def shutdown_offload_worker(self, wait: bool = True) -> None:
+        worker = self._offload_worker
+        if worker is None:
+            return
+
+        if wait:
+            self.flush_pending_offloads()
+
+        self._offload_queue.put(None)
+        if wait:
+            worker.join()
+
+        self._offload_worker = None
+
+    def _supports_stream_prefill_offload(self) -> bool:
+        # Raw pinned-memory offload bypasses self.compressor.compress() and stores
+        # plain key/value tensors directly. That is only correct for the NONE
+        # path. Compressed formats such as KIVI_2BIT / OURS / SVDQ must go
+        # through store_data() so their compressor-specific encode path runs.
+        return self.compress_type in {
+            CompressType.NONE,
+        }
+
+    def _supports_xj_project_pipeline(self) -> bool:
+        adapter = getattr(self, "_xj_adapter", None)
+        return adapter is not None and adapter.supports(self.compress_type)
 
     def check_keys_exist(self, keys: list) -> list[bool]:
         """
@@ -201,7 +322,10 @@ class KVCacheManager:
 
         return  flag
 
-    def offload_compress_data(self , key: str, data: List[torch.Tensor]):
+    def offload_compress_data(self, key: str, data: List[torch.Tensor], layer_idx: int = None):
+        if self.compress_type != CompressType.NONE:
+            return self.store_data(key, data, layer_idx=layer_idx)
+
         sequence_len = data[0].size(1)
 
         # allocate pinned memory
@@ -211,14 +335,67 @@ class KVCacheManager:
         # copy to pinned memory
         key_pinned.copy_(data[0] , non_blocking=True)
         value_pinned.copy_(data[1] , non_blocking=True)
-    
+
         torch.cuda.current_stream(device=self.device).synchronize()
         data = {"key": key_pinned , "value": value_pinned}
-        flag = self.db.store_data(key , data , compress_flag=True)
+        flag = self.db.store_data(
+            key,
+            data,
+            compress_flag=True,
+            async_disk_save=True,
+        )
 
         return flag
+
+    def offload_layer_data(
+        self,
+        key: str,
+        data,
+        layer_idx: int = None,
+        group_uuid: Optional[str] = None,
+    ):
+        """
+        Offload a layer's KV tensors to pinned CPU memory via a dedicated CUDA
+        stream worker. For compressor formats that cannot consume raw key/value
+        payloads on retrieval, fall back to the existing synchronous store path.
+        """
+        if self._supports_xj_project_pipeline():
+            return self._xj_adapter.offload(
+                key,
+                {"key": data[0], "value": data[1]},
+                group_uuid or key,
+            )
+
+        if (
+            not torch.cuda.is_available()
+            or str(data[0].device) == "cpu"
+            or not self._supports_stream_prefill_offload()
+        ):
+            return self.store_data(key, data, layer_idx=layer_idx)
+
+        self._start_offload_worker()
+        self._drain_completed_offload_futures()
+
+        future: Future = Future()
+        producer_event = torch.cuda.Event()
+        torch.cuda.current_stream(device=self.device).record_event(producer_event)
+        self._pending_offload_futures.append(future)
+        self._offload_queue.put(
+            {
+                "key": key,
+                "data": data,
+                "layer_idx": layer_idx,
+                "producer_event": producer_event,
+                "future": future,
+            }
+        )
+
+        return future
         
     def retrieve_by_task_id(self, task_id):
+        if self._supports_xj_project_pipeline():
+            return self._xj_adapter.get_prefetch_result(task_id)
+
         t0 = time.perf_counter()
         compress_data_cpu , compress_data_gpu = self.db.retrive_by_task(task_id)
         t1 = time.perf_counter()
@@ -243,6 +420,9 @@ class KVCacheManager:
         return compress_data_gpu
   
     def retrieve_keys(self , keys: List[str]):
+        if self._supports_xj_project_pipeline():
+            return self._xj_adapter.prefetch_remote(keys, device=self.device)
+
         # if keys and len(keys) > 0:
         #     print(f"[KVManager.retrieve_keys] keys={keys}", flush=True)
         t_start = time.perf_counter()
@@ -269,4 +449,7 @@ class KVCacheManager:
         return decompressed
 
     def clean(self):
+        self.shutdown_offload_worker(wait=True)
+        if getattr(self, "_xj_adapter", None) is not None:
+            self._xj_adapter.shutdown()
         self.db.clean()

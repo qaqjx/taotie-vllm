@@ -179,6 +179,7 @@ def start_vllm_server(args, compress_type: str) -> subprocess.Popen:
         "LMCACHE_MAX_LOCAL_CPU_SIZE": "5",
         "LMCACHE_COMPRESS_TYPE": compress_type,
         "HF_HUB_OFFLINE": "1",
+        "LMCACHE_ENABLE_PROFILING": os.environ.get("LMCACHE_ENABLE_PROFILING", "1"),
     })
 
     kv_config = json.dumps({
@@ -192,8 +193,6 @@ def start_vllm_server(args, compress_type: str) -> subprocess.Popen:
         "--port", str(args.port),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--max-model-len", str(args.max_model_len),
-        "--no-enable-prefix-caching",
-        "--no-enable-chunked-prefill",
         "--enforce-eager",
         "-tp", "1"
     ]
@@ -251,6 +250,28 @@ def wait_for_server(port: int, proc: Optional[subprocess.Popen] = None, timeout:
 
     print(f"[Server] 服务器启动超时 ({timeout}s)")
     return False
+
+
+def inspect_server_config(log_file: Path) -> None:
+    if not log_file.exists():
+        print("[Server] 未找到 server log，无法检查实际 prefix/chunked prefill 配置")
+        return
+
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "enable_prefix_caching=" not in line:
+                    continue
+                config_line = line.strip()
+                print(f"[Server] 实际生效配置: {config_line}")
+                if "enable_prefix_caching=True" in config_line:
+                    print("[Server] WARNING: 当前 vLLM runtime 实际开启了 prefix caching")
+                if "chunked_prefill_enabled=True" in config_line:
+                    print("[Server] WARNING: 当前 vLLM runtime 实际开启了 chunked prefill")
+                return
+        print("[Server] WARNING: 未在 server log 中发现实际 prefix/chunked prefill 配置")
+    except Exception as exc:
+        print(f"[Server] WARNING: 读取 server log 失败: {exc}")
 
 
 def stop_server(proc: subprocess.Popen):
@@ -335,27 +356,46 @@ def collect_results(output_dir: Path, compress_methods: List[str]) -> Dict:
 def generate_csv(all_results: Dict, output_csv: Path):
     """生成 CSV 汇总文件"""
     rows = []
-    header = "compress_method,rate_rps,ttft_avg_ms,ttft_p50_ms,ttft_p90_ms,ttft_p99_ms,latency_avg_ms,itl_avg_ms,success_rate,request_count"
+    header = (
+        "compress_method,rate_rps,headers_avg_ms,first_chunk_avg_ms,"
+        "first_choice_avg_ms,first_choice_p50_ms,first_choice_p90_ms,"
+        "first_choice_p99_ms,server_blend_envelope_avg_ms,"
+        "server_blend_core_avg_ms,latency_avg_ms,itl_avg_ms,success_rate,request_count"
+    )
 
     for method, data in all_results.items():
         results = data.get("results", {})
         for rate_str, rate_data in results.items():
             summary = rate_data.get("summary", {})
-            ttft = summary.get("ttft", {})
+            headers_latency = summary.get("headers_latency", {})
+            first_chunk_latency = summary.get("first_chunk_latency", {})
+            first_choice_latency = summary.get("first_choice_latency", {})
+            server_blend_envelope = summary.get("server_blend_envelope", {})
+            server_blend_core = summary.get("server_blend_core", {})
             latency = summary.get("latency", {})
             itl = summary.get("itl", {})
 
             # 转换为 ms
-            ttft_avg = (ttft.get("avg") or 0) * 1000
-            ttft_p50 = (ttft.get("p50") or 0) * 1000
-            ttft_p90 = (ttft.get("p90") or 0) * 1000
-            ttft_p99 = (ttft.get("p99") or 0) * 1000
+            headers_avg = (headers_latency.get("avg") or 0) * 1000
+            first_chunk_avg = (first_chunk_latency.get("avg") or 0) * 1000
+            first_choice_avg = (first_choice_latency.get("avg") or 0) * 1000
+            first_choice_p50 = (first_choice_latency.get("p50") or 0) * 1000
+            first_choice_p90 = (first_choice_latency.get("p90") or 0) * 1000
+            first_choice_p99 = (first_choice_latency.get("p99") or 0) * 1000
+            server_blend_envelope_avg = (server_blend_envelope.get("avg") or 0) * 1000
+            server_blend_core_avg = (server_blend_core.get("avg") or 0) * 1000
             latency_avg = (latency.get("avg") or 0) * 1000
             itl_avg = (itl.get("avg") or 0) * 1000
             success_rate = summary.get("success_rate", 0)
             request_count = summary.get("request_count", 0)
 
-            rows.append(f"{method},{rate_str},{ttft_avg:.2f},{ttft_p50:.2f},{ttft_p90:.2f},{ttft_p99:.2f},{latency_avg:.2f},{itl_avg:.2f},{success_rate},{request_count}")
+            rows.append(
+                f"{method},{rate_str},{headers_avg:.2f},{first_chunk_avg:.2f},"
+                f"{first_choice_avg:.2f},{first_choice_p50:.2f},{first_choice_p90:.2f},"
+                f"{first_choice_p99:.2f},{server_blend_envelope_avg:.2f},"
+                f"{server_blend_core_avg:.2f},{latency_avg:.2f},{itl_avg:.2f},"
+                f"{success_rate},{request_count}"
+            )
 
     with open(output_csv, 'w') as f:
         f.write(header + "\n")
@@ -382,7 +422,7 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
     for method, data in all_results.items():
         results = data.get("results", {})
         rates = []
-        ttfts = []
+        first_choices = []
 
         for rate_str, rate_data in sorted(results.items(), key=lambda x: float(x[0]) if x[0] != 'inf' else float('inf')):
             rate = float(rate_str) if rate_str != 'inf' else float('inf')
@@ -390,20 +430,20 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
                 continue  # 跳过 inf
 
             summary = rate_data.get("summary", {})
-            ttft_avg = summary.get("ttft", {}).get("avg")
+            ttft_avg = summary.get("first_choice_latency", {}).get("avg")
 
             if ttft_avg is not None:
                 rates.append(rate)
-                ttfts.append(ttft_avg)  # 已经是秒
+                first_choices.append(ttft_avg)  # 已经是秒
 
-        if rates and ttfts:
+        if rates and first_choices:
             color = colors.get(method, '#000000')
             marker = markers.get(method, 'o')
-            ax.plot(rates, ttfts, marker=marker, color=color, label=method, linewidth=2, markersize=8)
+            ax.plot(rates, first_choices, marker=marker, color=color, label=method, linewidth=2, markersize=8)
 
     ax.set_xlabel('Request Rate (RPS)', fontsize=12)
-    ax.set_ylabel('TTFT (s)', fontsize=12)
-    ax.set_title(f'Time To First Token vs Request Rate\n(contexts={args.num_contexts}, avg_tokens={args.avg_prompt_tokens})', fontsize=14)
+    ax.set_ylabel('First Choice Latency (s)', fontsize=12)
+    ax.set_title(f'First Choice Latency vs Request Rate\n(contexts={args.num_contexts}, avg_tokens={args.avg_prompt_tokens})', fontsize=14)
     ax.legend(loc='upper left')
     ax.grid(True, alpha=0.3)
 
@@ -419,7 +459,7 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
     plt.tight_layout()
 
     # 保存图表
-    linear_plot = output_dir / "ttft_vs_request_rate.png"
+    linear_plot = output_dir / "first_choice_vs_request_rate.png"
     plt.savefig(linear_plot, dpi=150, bbox_inches='tight')
     print(f"[Output] 线性图保存到: {linear_plot}")
 
@@ -429,7 +469,7 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
     for method, data in all_results.items():
         results = data.get("results", {})
         rates = []
-        ttfts = []
+        first_choices = []
 
         for rate_str, rate_data in sorted(results.items(), key=lambda x: float(x[0]) if x[0] != 'inf' else float('inf')):
             rate = float(rate_str) if rate_str != 'inf' else float('inf')
@@ -437,26 +477,26 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
                 continue
 
             summary = rate_data.get("summary", {})
-            ttft_avg = summary.get("ttft", {}).get("avg")
+            ttft_avg = summary.get("first_choice_latency", {}).get("avg")
 
             if ttft_avg is not None:
                 rates.append(rate)
-                ttfts.append(ttft_avg)
+                first_choices.append(ttft_avg)
 
-        if rates and ttfts:
+        if rates and first_choices:
             color = colors.get(method, '#000000')
             marker = markers.get(method, 'o')
-            ax2.loglog(rates, ttfts, marker=marker, color=color, label=method, linewidth=2, markersize=8)
+            ax2.loglog(rates, first_choices, marker=marker, color=color, label=method, linewidth=2, markersize=8)
 
     ax2.set_xlabel('Request Rate (RPS)', fontsize=12)
-    ax2.set_ylabel('TTFT (s) - Log Scale', fontsize=12)
-    ax2.set_title(f'Time To First Token vs Request Rate (Log-Log Scale)\n(contexts={args.num_contexts}, avg_tokens={args.avg_prompt_tokens})', fontsize=14)
+    ax2.set_ylabel('First Choice Latency (s) - Log Scale', fontsize=12)
+    ax2.set_title(f'First Choice Latency vs Request Rate (Log-Log Scale)\n(contexts={args.num_contexts}, avg_tokens={args.avg_prompt_tokens})', fontsize=14)
     ax2.legend(loc='upper left')
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
-    loglog_plot = output_dir / "ttft_vs_request_rate_loglog.png"
+    loglog_plot = output_dir / "first_choice_vs_request_rate_loglog.png"
     plt.savefig(loglog_plot, dpi=150, bbox_inches='tight')
     print(f"[Output] 对数图保存到: {loglog_plot}")
 
@@ -466,7 +506,7 @@ def generate_plot(all_results: Dict, output_dir: Path, args):
 def print_summary(all_results: Dict, args):
     """打印汇总表格"""
     print("\n" + "=" * 80)
-    print("TTFT 汇总 (单位: 秒)")
+    print("First Choice Latency 汇总 (单位: 秒)")
     print("=" * 80)
 
     # 收集所有请求率
@@ -492,7 +532,7 @@ def print_summary(all_results: Dict, args):
             rate_str = str(int(rate)) if rate == int(rate) else str(rate)
             rate_data = results.get(rate_str, {})
             summary = rate_data.get("summary", {})
-            ttft_avg = summary.get("ttft", {}).get("avg")
+            ttft_avg = summary.get("first_choice_latency", {}).get("avg")
 
             if ttft_avg is not None:
                 row += f"{ttft_avg:.3f}".center(12)
@@ -545,6 +585,7 @@ def main():
                     print(f"[Error] 服务器启动失败，跳过 {method}")
                     stop_server(server_proc)
                     continue
+                inspect_server_config(output_dir / f"vllm_server_{method}.log")
 
             # 运行 benchmark
             output_json = str(output_dir / f"benchmark_{method}.json")

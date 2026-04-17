@@ -253,7 +253,7 @@ If you look at the logs of your vLLM server, you should see (the logs are trunca
 
     # Cold LMCache Miss and then Store
 
-    LMCache INFO: Reqid: chatcmpl-8676f9b9ebf04c79a5d47b9ada7b65fd, Total tokens 15410,
+    LMCache INFO: Reqid: chatcmpl-8676f9b9ebf04c79a5d47b9ada7b65fd, *.py15410,
     LMCache hit tokens: 0, need to load: 0
 
     # you should see 8 of these storing logs total
@@ -269,7 +269,7 @@ If you look at the logs of your vLLM server, you should see (the logs are trunca
 
     # Warm LMCache Hit!!
 
-    LMCache INFO: Reqid: chatcmpl-136d9dac1ba94bd4b4ae85007e8ad437, Total tokens 15410,
+    LMCache INFO: Reqid: chatcmpl-136d9dac1ba94bd4b4ae85007e8ad437, *.py15410,
     LMCache hit tokens: 15409, need to load: 1
 
 .. _cpu_ram-tips:

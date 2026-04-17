@@ -7,109 +7,159 @@ from lmcache.v1.compute.blend.compress.abstract import AbstractCompress
 # Profiling toggle replicated here to avoid circular imports.
 ENABLE_PROFILING = os.environ.get("LMCACHE_ENABLE_PROFILING", "0") == "1"
 
+def allocate_low_rank(total_budget_bytes: int, dim: int, token_num: int , high_rank: int = 512) -> int:
+    budget_per_rank = 4 * 16 + (token_num + dim) * 4
+    low_rank = (total_budget_bytes * 8  - (high_rank * token_num * 4 + high_rank * 2 * 16 + high_rank * dim * 16))// budget_per_rank
+
+    if low_rank < 0:
+        low_rank = 0
+        high_rank = total_budget_bytes * 8 // (token_num * 4 + 2 * 16 + dim * 16)
+
+    return low_rank , high_rank
+
+class UniformAllocate():
+    def __init__(self):
+        pass
+
+    def _calculate_ranks(self, total_budget_bytes: int, num_layers: int, dim: int, token: int) -> int:
+        budget_per_rank = 4 * 16 + (token + dim) * 4  # 4 bytes per float
+        return total_budget_bytes * 8 // budget_per_rank
+    
+    def allocate(self, total_budget_bytes: int, num_layers: int, dim: int, token_num: int,
+                 score: list = None, max_rank: int = 0) -> list:
+        all_rank = self._calculate_ranks(total_budget_bytes, num_layers, dim, token_num)
+        
+        rank_per_layer = int(all_rank // num_layers)
+        rank = rank_per_layer * num_layers
+        
+        if token_num >= 8192:
+            max_rank = 256 
+        elif token_num >= 4096:
+            max_rank = 384
+        else:
+            max_rank = 512
+
+        return  min(max_rank, rank, 1024, token_num)
+
+def calculate_elbow(singular_values: torch.Tensor , max_x = None , min_s = None) -> int:
+    """Find elbow point in singular values using distance-to-chord heuristic."""
+    if singular_values.dim() == 1:
+        singular_values = singular_values.unsqueeze(0)
+
+    device = singular_values.device
+    B, N = singular_values.shape
+
+    x_coords = torch.arange(N, dtype=torch.float32, device=device).unsqueeze(0)
+
+    all_coords = torch.stack([x_coords.expand(B, N), singular_values], dim=-1)
+    first_point = all_coords[:, 0, :]
+    if max_x is not None:
+      last_point = torch.tensor([max_x, min_s], device=device).unsqueeze(0)
+    else:
+      last_point = all_coords[:, -1, :]
+
+    line_vec = last_point - first_point
+    point_vec = all_coords - first_point.unsqueeze(1)
+
+    cross_product = torch.abs(
+        line_vec[:, 0:1] * point_vec[:, :, 1] - line_vec[:, 1:2] * point_vec[:, :, 0]
+    )
+
+    line_norm = torch.linalg.norm(line_vec, dim=1)
+
+    small_norm_mask = line_norm < 1e-10
+    line_norm = torch.where(small_norm_mask, torch.ones_like(line_norm), line_norm)
+
+    distances = cross_product / line_norm.unsqueeze(1)
+
+    _, indices = torch.max(distances, dim=1)
+    mean_elbow_dim = int(indices.float().mean().item())
+
+    return mean_elbow_dim
+
 
 def profile_log(msg: str):
     if ENABLE_PROFILING:
         print(f"[PROFILE] {msg}", flush=True)
 
-def calculate_elbow(singular_value: torch.Tensor) -> float:
+
+def _prepare_matrix(A: torch.Tensor) -> torch.Tensor:
+    if A.dim() == 3:
+        A = A.squeeze(0)
+    if A.dtype not in (torch.float32, torch.float64):
+        A = A.float()
+    return A
+
+def _gram_matrix(A: torch.Tensor) -> torch.Tensor:
+    A = _prepare_matrix(A)
+    m, n = A.shape
+    return A.T @ A if m >= n else A @ A.T
+
+def sigma_min_power_iter(
+    A: torch.Tensor,
+    eps: float = 1e-12,
+    num_iters: int = 4,
+) -> torch.Tensor:
+    """Fast inverse power iteration for minimum singular value.
+
+    Optimized with:
+    - Minimal iterations (4 for speed)
+    - LU factorization reuse
+    - Minimal allocations
     """
-    Find the elbow point for each sample in a batch of singular values,
-    then return the mean elbow dimension (soft-argmax not used; hard argmax + float mean).
+    B = _gram_matrix(A)
+    dim = B.shape[0]
 
-    Args:
-        singular_value (Tensor): Shape [B, N], each row is a sorted singular value vector (descending)
+    # Initialize random vector
+    v = torch.randn(dim, dtype=B.dtype, device=B.device)
+    v = v / torch.norm(v)
 
-    Returns:
-        float: Mean elbow dimension across the batch (scalar, detached float)
-    """
-    device = singular_value.device
-    B, N = singular_value.shape
-    
-    log_s = torch.log(singular_value + 1e-16)  # [B, N]
-    # print(f"singular value {singular_value[: , -1]} ,log s {log_s[: , -1]}")
-    # x coordinates: same for all batches -> [0, 1, ..., N-1]
-    x_coords = torch.arange(N, dtype=torch.float32, device=device).unsqueeze(0)  # [1, N]
-    
-    # Coordinates: [B, N, 2] where last dim is (x, log_s)
-    all_coords = torch.stack([x_coords.expand(B, N), log_s], dim=-1)  # [B, N, 2]
+    # Estimate shift
+    trace = torch.trace(B)
+    shift = trace / dim * 0.05
 
-    # First and last points: shape [B, 2]
-    first_point = all_coords[:, 0, :]  # [B, 2]
-    last_point = all_coords[:, -1, :]  # [B, 2]
+    eye = torch.eye(dim, dtype=B.dtype, device=B.device)
+    B_shifted = B + shift * eye
 
-    # Vector from first to last: [B, 2]
-    line_vec = last_point - first_point  # [B, 2]
+    # Pre-factorize LU
+    try:
+        lu, pivots = torch.linalg.lu_factor(B_shifted)
+    except:
+        # Fallback
+        for _ in range(num_iters):
+            v = torch.linalg.solve(B_shifted, v)
+            v_norm = torch.norm(v)
+            if v_norm < 1e-10:
+                break
+            v = v / v_norm
+        lam_min = torch.dot(v, B @ v)
+        lam_min = torch.clamp(lam_min, min=0.0)
+        return torch.sqrt(lam_min + eps)
 
-    # Vectors from first point to each point: [B, N, 2]
-    point_vec = all_coords - first_point.unsqueeze(1)  # [B, N, 2]
+    # LU-accelerated iteration
+    for _ in range(num_iters):
+        v = torch.linalg.lu_solve(lu, pivots, v.unsqueeze(-1)).squeeze(-1)
+        v_norm = torch.norm(v)
+        if v_norm < 1e-10:
+            break
+        v = v / v_norm
 
-    # Cross product in 2D: |line_vec_x * point_vec_y - line_vec_y * point_vec_x|
-    cross_product = torch.abs(
-        line_vec[:, 0:1] * point_vec[:, :, 1] - line_vec[:, 1:2] * point_vec[:, :, 0]
-    )  # [B, N]
+    # Rayleigh quotient
+    lam_min = torch.dot(v, B @ v)
+    lam_min = torch.clamp(lam_min, min=0.0)
 
-    # Norm of line vector: [B]
-    line_norm = torch.linalg.norm(line_vec, dim=1)  # [B]
-
-    # Handle near-zero norm (constant lines)
-    small_norm_mask = line_norm < 1e-10
-    line_norm = torch.where(small_norm_mask, torch.ones_like(line_norm), line_norm)
-
-    # Distance from each point to the line: [B, N]
-    distances = cross_product / line_norm.unsqueeze(1)  # [B, N]
-
-    # Find elbow index for each batch
-    _, indices = torch.max(distances, dim=1)  # indices: [B], long tensor
-    mean_elbow_dim = indices.float().mean().item()
-
-    return mean_elbow_dim
-
-class UniformAllocate():
-    def __init__(self):
-        pass
-    def _calculate_ranks(self, total_budget_bytes: int, num_layers: int, dim: int, token: int) -> int:
-        budget_per_rank = 4 * 16 + (token + dim) * 4  # 4 bytes per float
-        return total_budget_bytes * 8 // budget_per_rank
-        
-    def allocate(self, total_budget_bytes: int, num_layers: int, dim: int, token_num: int,
-                 score: list = None, max_rank: int = 0) -> list:
-
-        all_rank = self._calculate_ranks(total_budget_bytes, num_layers, dim, token_num)
-        
-        rank_per_layer = int(all_rank // num_layers)
-        ranks = [rank_per_layer] * num_layers
-        return ranks
-
+    return torch.sqrt(lam_min + eps)
 
 class Ours(AbstractCompress):
-    def __init__(self, device="cuda", config: dict = None):
+    def __init__(self, layer_num: int = 0, device="cuda", config: dict = None):
         super().__init__(device=device)
+        self.layer_num = layer_num
         self.ratio = 0.1
-        self.last_final_ranks = None
-
-    def _sync_if_needed(self):
-        if not ENABLE_PROFILING or not torch.cuda.is_available():
-            return
-        device = self.device
-        if isinstance(device, torch.device):
-            if device.type != "cuda":
-                return
-        elif isinstance(device, str):
-            if not device.startswith("cuda"):
-                return
-            device = torch.device(device)
-        elif isinstance(device, int):
-            pass
-        else:
-            return
-        torch.cuda.synchronize(device=device)
 
     def sq_compress(self, data) -> dict:
         u , v = data
         assert u.device != "cpu", "SVD compression only supports CUDA tensors"
 
-        type = u.dtype
         u_min = torch.min(u, dim=-1, keepdim=True).values
         u_max = torch.max(u, dim=-1, keepdim=True).values
         u_range = u_max - u_min + 1e-6
@@ -145,7 +195,7 @@ class Ours(AbstractCompress):
         split_dim = v.size(0) // 2
         residual_key_sv = v[:split_dim,:self.key_residual_dim,:]
         residual_value_sv = v[split_dim:,:self.value_residual_dim,:]
-
+        print(f"Compressing with ratio {self.ratio}: original u shape {u.shape}, v shape {v.shape}, quantized u shape {u_quantized.shape}, v shape {v_quantized.shape}, residual_key_sv shape {residual_key_sv.shape}, residual_value_sv shape {residual_value_sv.shape}")
         return {
             f"u_quantized": u_quantized.cpu().contiguous(),
             f"u_meta": u_meta.cpu(),
@@ -156,11 +206,12 @@ class Ours(AbstractCompress):
             f"key_residual_sv": residual_key_sv.cpu(),
             f"value_residual_sv": residual_value_sv.cpu(),
 
-            # f"key_residual_u": residual_key_u.cpu().contiguous(),
-            # f"value_residual_u": residual_value_u.cpu().contiguous(),
         }
 
     def sq_decompress(self, compressed_data ,kv_len) -> tuple:
+        return self._sq_decompress_combined(compressed_data, kv_len)
+    
+    def _sq_decompress_combined(self, compressed_data, kv_len) -> tuple:
         u_quantized = compressed_data[f"u_quantized"]
         u_meta = compressed_data[f"u_meta"]
         v_quantized = compressed_data[f"v_quantized"]
@@ -186,24 +237,26 @@ class Ours(AbstractCompress):
 
         residual_key_v_dim = min(v_dequantized.size(1), residual_key_v.size(1))
         residual_value_v_dim = min(v_dequantized.size(1), residual_value_v.size(1))
- 
+
         v_dequantized[:split_dim, :residual_key_v_dim, :] = residual_key_v[: ,:residual_key_v_dim, :]
         v_dequantized[split_dim:, :residual_value_v_dim, :] = residual_value_v[: ,:residual_value_v_dim, :]
-
         return u_dequantized, v_dequantized
 
-    def svd(self, x):
-        layer_num = x.shape[0]
-        all_u = []
-        all_s = []
-        all_v = []
-        for i in range(0, layer_num):
-            u , s , v = torch.linalg.svd(x[i : i + 1].reshape(-1, x.shape[1], x.shape[2] * x.shape[3]).float(), full_matrices=False)
-            all_u.append(u.to(x.dtype))
-            all_s.append(s)
-            all_v.append(v)
-        all_s = torch.cat(all_s, dim=0)
-        return all_u , all_s , all_v
+    def svd(self, x , rank):
+        num_type = x.dtype
+        print(f"Performing SVD on tensor of shape {x.shape} with target rank {rank}")
+        try:
+            u , s , v = torch.svd_lowrank(x.reshape(-1, x.shape[1], x.shape[2] * x.shape[3]).float(), rank)
+        except RuntimeError as e:
+            u , s , v = torch.svd(x.reshape(-1, x.shape[1], x.shape[2] * x.shape[3]).float())
+            u = u[:, : , : rank]
+            s = s[:, : rank]
+            v = v[:, : rank, :].transpose(-1, -2)
+      
+        s_min = sigma_min_power_iter(x.reshape(-1, x.shape[1], x.shape[2] * x.shape[3]).float())
+        # print(f"fake s_min: {s_min} , actual s_min {s.min()}")
+        u = u.to(num_type)
+        return u , s , v.transpose(-1, -2) , s_min
 
     def compress(self, all_layer_kv: list, scores: list = None, layer_idx: int = 0 ) -> list:
         """
@@ -223,70 +276,96 @@ class Ours(AbstractCompress):
         num_layers , seq_len , num_heads , head_dim = key.shape
         total_original_mem_bytes = num_layers * seq_len * num_heads * head_dim * (key.element_size()) * self.ratio
         # 2. Gather metadata for rank calculation
+        final_ranks = UniformAllocate().allocate(
+            total_budget_bytes=total_original_mem_bytes,
+            num_layers=1,
+            dim=head_dim * num_heads,
+            token_num=seq_len
+        )
         # 3. SVD
-        key_u , key_s , key_v = self.svd(key)
-        value_u , value_s , value_v = self.svd(value)
-        key_residual_dim = int(calculate_elbow(key_s))
-        value_residual_dim = int(calculate_elbow(value_s))
-
-        final_ranks = 0
-        if layer_idx < 1:
-            final_ranks = UniformAllocate().allocate(
-                total_budget_bytes=total_original_mem_bytes,
-                num_layers=1,
-                dim=head_dim * num_heads,
-                token_num=seq_len
-            )[0]
-        else:  
-            final_ranks = UniformAllocate().allocate(
-                total_budget_bytes=total_original_mem_bytes,
-                num_layers=1,
-                dim=head_dim * num_heads,
-                token_num=seq_len
-            )[0]
-
+        key_u , key_s , key_v , key_s_min = self.svd(key, final_ranks)
+        value_u , value_s , value_v , value_s_min = self.svd(value, final_ranks)
+        key_residual_dim = int(calculate_elbow(key_s, max_x = min(num_heads*head_dim , seq_len) , min_s = key_s_min))
+        value_residual_dim = int(calculate_elbow(value_s, max_x = min(num_heads*head_dim , seq_len) , min_s = value_s_min))
+ 
         max_residual_rank = max(final_ranks - 1, 0)
         self.key_residual_dim = min(key_residual_dim, max_residual_rank)
         self.value_residual_dim = min(value_residual_dim, max_residual_rank)
-
+        
+        high_rank = (self.key_residual_dim + self.value_residual_dim) // 2
+        low_rank, high_rank = allocate_low_rank(total_original_mem_bytes, head_dim * num_heads, seq_len, high_rank)
+        final_rank = int(low_rank + high_rank)
         # only one layer data
-        u = torch.cat([key_u[0][:, : , : final_ranks], value_u[0 ][:, : , : final_ranks]], dim=0).transpose(-1, -2)
-        s = torch.cat([key_s[0 : 1, : final_ranks], value_s[0 : 1, : final_ranks]], dim=0)
-        v = torch.cat([key_v[0][: , : final_ranks, :], value_v[0][:, : final_ranks, :]], dim=0)    
+        u = torch.cat([key_u[:, : , : final_rank], value_u[:, : , : final_rank]], dim=0).transpose(-1, -2)
+        s = torch.cat([key_s[0 : 1, : final_rank], value_s[0 : 1, : final_rank]], dim=0)
+        v = torch.cat([key_v[: , : final_rank, :], value_v[:, : final_rank, :]], dim=0)    
         sv = torch.diag_embed(s) @ v
-
         # Store for debugging purposes.
-        self.last_final_ranks = final_ranks
         data = self.sq_compress((u, sv.to(u.dtype)))
 
         return data
     
     def transfer(self, compressed_data):
-        self._sync_if_needed()
-        transfer_start = time.perf_counter()
-        compressed_data[f"u_quantized"] = compressed_data[f"u_quantized"].to(self.device, non_blocking=True)
-        compressed_data[f"u_meta"] = compressed_data[f"u_meta"].to(self.device, non_blocking=True)
-
-        compressed_data[f"v_quantized"] = compressed_data[f"v_quantized"].to(self.device, non_blocking=True)
-        compressed_data[f"v_meta"] = compressed_data[f"v_meta"].to(self.device, non_blocking=True)
-
-        compressed_data[f"key_residual_sv"] = compressed_data[f"key_residual_sv"].to(self.device, non_blocking=True)
-        compressed_data[f"value_residual_sv"] = compressed_data[f"value_residual_sv"].to(self.device, non_blocking=True)
-        self._sync_if_needed()
-        transfer_end = time.perf_counter()
-        profile_log(
-            f"Ours.transfer: moved {len(compressed_data)} tensors to {self.device} in {(transfer_end - transfer_start) * 1000:.2f}ms"
-        )
-
+        for key in compressed_data:
+            compressed_data[key] = compressed_data[key].to(self.device, non_blocking=True)
         return compressed_data
 
-    def decompress(self, compressed_data , kv_len):
-        sq_start = time.perf_counter()
-        u , sv = self.sq_decompress(compressed_data, kv_len)
-        
-        matmul_start = time.perf_counter()
+    def decompress(self, compressed_data, kv_len):
+        u, sv = self.sq_decompress(compressed_data, kv_len)
         u = u.transpose(-1, -2).contiguous()
-        kv = torch.matmul(u , sv)
-       
+        kv = torch.matmul(u, sv)
+        return kv[0], kv[1]
+ 
+    def compress_multi(self, layer_kv: list, indices = None):
+        key , value = layer_kv
+        num_layers , seq_len , num_heads , head_dim = key.shape
+        group_size = len(indices) 
 
-        return kv[0] , kv[1]
+        total_original_mem_bytes = num_layers * seq_len * num_heads * head_dim * (key.element_size()) * self.ratio / group_size
+
+        final_ranks = UniformAllocate().allocate(
+            total_budget_bytes=total_original_mem_bytes,
+            num_layers=1,
+            dim=head_dim * num_heads,
+            token_num=seq_len // group_size
+        ) 
+        # print(f"compress_multi: total_original_mem_bytes={total_original_mem_bytes}, final_ranks={final_ranks}, group_size={group_size}")
+        key_u , key_s , key_v , key_s_min = self.svd(key , final_ranks)
+        key_residual_dim = int(calculate_elbow(key_s, max_x = min(num_heads*head_dim , seq_len) , min_s = key_s_min))
+        max_residual_rank = max(final_ranks - 1, 0)
+        self.key_residual_dim = min(key_residual_dim, max_residual_rank)
+        
+        data_list = []
+
+        for indice in indices:
+            value_u , value_s , value_v , value_s_min = self.svd(value[:, indice[0]:indice[1], :, :] , final_ranks)
+
+            value_residual_dim = int(calculate_elbow(value_s, max_x = min(num_heads*head_dim , seq_len) , min_s = value_s_min))
+            self.value_residual_dim = min(value_residual_dim, max_residual_rank)
+
+            # only one layer data
+            print(f"key_u shape {key_u.shape} , value_u shape {value_u.shape} , final_ranks {final_ranks}, indice {indice}")
+            final_rank = min(final_ranks , indice[1] - indice[0])
+            u = torch.cat([key_u[:, indice[0]:indice[1], : final_rank], value_u[:, : , : final_rank]], dim=0).to(torch.bfloat16)
+            s = torch.cat([key_s[0: 1, : final_rank], value_s[0 : 1, : final_rank]], dim=0)
+            v = torch.cat([key_v[: , : final_rank, :], value_v[:, : final_rank, :]], dim=0)    
+            sv = (torch.diag_embed(s) @ v).to(torch.bfloat16)   
+
+            # truncate u and sv for residual
+            # compute the rank by compute ratio
+            high_rank = (self.key_residual_dim + self.value_residual_dim) // 2
+            low_rank, high_rank = allocate_low_rank(total_original_mem_bytes, head_dim * num_heads, seq_len // group_size, high_rank)
+            final_rank = int(low_rank + high_rank)
+            print(f"chunk {indice} : key_residual_dim={self.key_residual_dim}, value_residual_dim={self.value_residual_dim}, low_rank={low_rank}, high_rank={high_rank}, final_rank={final_rank}")
+            u = u[:, : , : final_rank]
+            sv = sv[:, : final_rank, :]
+
+            data_list.append(
+                self.sq_compress(
+                    ( u.transpose(-1, -2),
+                        sv.to(u.dtype)
+                    )
+                )
+            )
+        
+        return data_list

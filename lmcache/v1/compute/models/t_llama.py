@@ -2,12 +2,21 @@
 # Third Party
 from asyncio.log import logger
 from gguf import Optional
+import os
 from torch import nn
+import time
 import torch
 
 # First Party
 # from lmcache.v1.compute.attention.utils import infer_attn_backend_from_vllm
 from lmcache.v1.compute.positional_encoding import get_fused_rope
+
+ENABLE_PROFILING = os.environ.get("LMCACHE_ENABLE_PROFILING", "0") == "1"
+
+
+def profile_log(msg: str) -> None:
+    if ENABLE_PROFILING:
+        print(f"[PROFILE] {msg}", flush=True)
 
 # TODO(Jiayi): A few things need to be tested/supported:
 # TP, PP, Multimodal
@@ -79,7 +88,6 @@ class TaoTieLMCLlamaModel(nn.Module):
         gpu_connector = blend_meta.get("gpu_connector", None) if blend_meta else None
         hash_text = blend_meta.get("hash_text", "") if blend_meta else ""
         blend_flag = blend_meta.get("flag", 0) if blend_meta else 0
-        indices = blend_meta.get("indices", []) if blend_meta else []
         state = blend_meta.get("state", "retrieve") if blend_meta else "retrieve"
 
         input_ids = input_ids.cuda()
@@ -104,15 +112,31 @@ class TaoTieLMCLlamaModel(nn.Module):
                 self.vllm_model.model.start_layer : self.vllm_model.model.end_layer
             ]
         ):
+            layer_start = time.perf_counter()
             logger.info(f"Computing layer {idx} with TaoTie blending")
             # TaoTie: Prefetch KV cache for current layer
+            prefetch_ms = 0.0
             if context_manager is not None and state != "store":
+                prefetch_start = time.perf_counter()
                 context_manager.prefetch_chunk_kv(
                     hash_text,
-                    indices,
+                    blend_meta.get("indices", []),
                     input_len,
                     layer_idx=idx + 1,
                 )
+                blend_meta["hash_text"] = context_manager.get_effective_hash_text()
+                blend_meta["indices"] = context_manager.get_effective_indices()
+                prefetch_ms = (time.perf_counter() - prefetch_start) * 1000
+                profile_log(
+                    f"compute_layer: layer={idx} prefetch_chunk_kv took {prefetch_ms:.2f}ms"
+                )
+
+            use_runtime_reuse = (
+                blend_flag != 0
+                and idx
+                and context_manager is not None
+                and context_manager.has_valid_reuse()
+            )
 
             # Layer norm
             if residual is None:
@@ -136,19 +160,27 @@ class TaoTieLMCLlamaModel(nn.Module):
             k = k.view(1, sequence_len, -1, 128)
             v = v.view(1, sequence_len, -1, 128)
 
-            if blend_flag != 0 and idx:
+            attn_start = time.perf_counter()
+            attn_mode = "prefill"
+            if use_runtime_reuse:
                 if idx == 1:
+                    attn_mode = "prefill_select_token"
                     attn_output, recomputed_idx = context_manager.prefill_select_token(
                         q, k, v, idx, blend_meta
                     )
                     residual = residual[recomputed_idx]
 
                 else:
+                    attn_mode = "prefill_blend"
                     attn_output = context_manager.prefill_blend(
                         q, k, v, idx, recomputed_idx, blend_meta
                     )
             else:
                 attn_output = context_manager.prefill(q , k , v , idx, blend_meta)
+            attn_ms = (time.perf_counter() - attn_start) * 1000
+            profile_log(
+                f"compute_layer: layer={idx} attn_path={attn_mode} took {attn_ms:.2f}ms"
+            )
 
             num_heads = self.vllm_attn_layers[idx].num_heads
             num_kv_heads = self.vllm_attn_layers[idx].num_kv_heads
@@ -158,6 +190,7 @@ class TaoTieLMCLlamaModel(nn.Module):
             attn_output = attn_output.view(-1, num_heads * head_size)
 
             # Output projection
+            post_attn_start = time.perf_counter()
             hidden_states, _ = layer.self_attn.o_proj(attn_output)
 
             # Fully Connected (MLP)
@@ -165,3 +198,11 @@ class TaoTieLMCLlamaModel(nn.Module):
                 hidden_states, residual
             )
             hidden_states = layer.mlp(hidden_states)
+            post_attn_ms = (time.perf_counter() - post_attn_start) * 1000
+            profile_log(
+                f"compute_layer: layer={idx} post_attn_mlp took {post_attn_ms:.2f}ms"
+            )
+            profile_log(
+                "compute_layer: "
+                f"layer={idx} total took {(time.perf_counter() - layer_start) * 1000:.2f}ms"
+            )
