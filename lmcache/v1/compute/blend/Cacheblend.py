@@ -19,7 +19,7 @@ class CacheBlend():
    
     return deviation
 
-  def blend_forward(self, query, key, value, retrieve_kv):
+  def blend_forward(self, query, key, value, retrieve_kv , active_indices):
     """
     Perform the blend forward operation with caching.
     
@@ -31,17 +31,14 @@ class CacheBlend():
     Returns:
         tensor: The result of the blend forward operation.
     """
-
     not_reused_mask = torch.ones(
         query.size(1), device=query.device, dtype=torch.bool
     )
-
-    offset = 0 
     
-    for indice in self.blend_meta["indices"]:
+    for indice in active_indices:
       start = indice[-2]
       end = indice[-1]
-      not_reused_mask[start + offset:end] = False
+      not_reused_mask[start:end] = False
 
     retrieve_key, retrieve_value = retrieve_kv
 

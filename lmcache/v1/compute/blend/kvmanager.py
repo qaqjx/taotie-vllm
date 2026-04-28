@@ -25,6 +25,13 @@ def get_compress_type_from_env() -> CompressType:
     Default: KIVI_2BIT
     """
     env_value = os.environ.get("LMCACHE_COMPRESS_TYPE", "KIVI_2BIT").upper()
+    return _normalize_compress_type(env_value)
+
+
+def _normalize_compress_type(value) -> CompressType:
+    if isinstance(value, CompressType):
+        return value
+    env_value = str(value).upper()
     compress_map = {
         "NONE": CompressType.NONE,
         "KIVI_2BIT": CompressType.KIVI_2BIT,
@@ -37,6 +44,33 @@ def get_compress_type_from_env() -> CompressType:
     else:
         profile_log(f"[KVCacheManager] Unknown compress type '{env_value}', using KIVI_2BIT")
         return CompressType.KIVI_2BIT
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_value(config: Optional[Dict[str, Any]], key: str, default):
+    if not config:
+        return default
+    value = config.get(key)
+    return default if value is None else value
+
+
+def _config_flag(
+    config: Optional[Dict[str, Any]], key: str, default: bool
+) -> bool:
+    value = _config_value(config, key, None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 from lmcache.v1.compute.blend.compress.kivi import Kivi2Bit
 from lmcache.v1.compute.blend.compress.normal import Normal
 from lmcache.v1.compute.blend.compress.our import Ours
@@ -104,11 +138,24 @@ class KVCacheManager:
     _lock = threading.Lock()
 
     @classmethod
-    def get_instance(cls, shape = None, layer_num = None, device = None):
+    def get_instance(
+        cls,
+        shape=None,
+        layer_num=None,
+        device=None,
+        compress_type=None,
+        xj_project_config: Optional[Dict[str, Any]] = None,
+    ):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = KVCacheManager(shape = shape, layer_num = layer_num , device = device)
+                    cls._instance = KVCacheManager(
+                        shape=shape,
+                        layer_num=layer_num,
+                        device=device,
+                        compress_type=compress_type,
+                        xj_project_config=xj_project_config,
+                    )
         return cls._instance
     
     @classmethod
@@ -125,6 +172,7 @@ class KVCacheManager:
         compress_type=None,  # If None, read from env LMCACHE_COMPRESS_TYPE
         compress_config=None,
         io_config: Optional[Dict[str, Any]] = None,
+        xj_project_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the KVCacheManager with specified parameters.
@@ -144,6 +192,7 @@ class KVCacheManager:
         self.max_buffer_size = max_buffer_size
 
         self.io_config = io_config or {}
+        self.xj_project_config = xj_project_config or {}
         self.db = DataCenter(
             max_buffer_size=max_buffer_size,
             device=device,
@@ -152,20 +201,79 @@ class KVCacheManager:
         # If compress_type is None, read from environment variable
         if compress_type is None:
             compress_type = get_compress_type_from_env()
+        else:
+            compress_type = _normalize_compress_type(compress_type)
         self.compress_type = compress_type
         self.layer_num = layer_num
         self.compress_config = compress_config or {}
         self.compressor = CompressFactory.create_compressor(compress_type, self.compress_config, layer_num=layer_num , device=self.device)
+        legacy_xj_enabled = _config_flag(
+            self.xj_project_config,
+            "enabled",
+            _env_flag("LMCACHE_USE_XJ_PROJECT", False),
+        )
+        xj_store_enabled = _config_flag(
+            self.xj_project_config,
+            "store_enabled",
+            _env_flag("LMCACHE_XJ_STORE", legacy_xj_enabled),
+        )
+        xj_prefetch_enabled = _config_flag(
+            self.xj_project_config,
+            "prefetch_enabled",
+            _env_flag("LMCACHE_XJ_PREFETCH", legacy_xj_enabled),
+        )
         self._xj_adapter = XJProjectBlendAdapter(
             XJProjectAdapterConfig(
-                enabled=os.environ.get("LMCACHE_USE_XJ_PROJECT", "0") == "1",
+                enabled=xj_store_enabled or xj_prefetch_enabled,
                 config_path=self.io_config.get("xj_s3_config")
+                or _config_value(self.xj_project_config, "s3_config", None)
                 or os.environ.get("LMCACHE_XJ_S3_CONFIG"),
-                ratio=self.compress_config.get("ratio", 0.15),
-                num_workers=self.compress_config.get("num_workers", 4),
-                max_queue_bytes=self.compress_config.get("max_queue_bytes", 0),
+                store_enabled=xj_store_enabled,
+                prefetch_enabled=xj_prefetch_enabled,
+                ratio=_config_value(
+                    self.xj_project_config,
+                    "ratio",
+                    self.compress_config.get("ratio", 0.15),
+                ),
+                num_workers=int(
+                    _config_value(
+                        self.xj_project_config,
+                        "num_workers",
+                        self.compress_config.get("num_workers", 32),
+                    )
+                ),
+                max_queue_bytes=int(
+                    _config_value(
+                        self.xj_project_config,
+                        "max_queue_bytes",
+                        self.compress_config.get("max_queue_bytes", 0),
+                    )
+                ),
                 dtype=self.compress_config.get("dtype", torch.bfloat16),
-                prefetch_workers=self.compress_config.get("prefetch_workers", 16),
+                prefetch_workers=int(
+                    _config_value(
+                        self.xj_project_config,
+                        "prefetch_workers",
+                        self.compress_config.get("prefetch_workers", 16),
+                    )
+                ),
+                queue_log_path=_config_value(
+                    self.xj_project_config,
+                    "queue_log_path",
+                    os.environ.get("LMCACHE_XJ_QUEUE_LOG"),
+                ),
+                queue_log_stdout=_config_flag(
+                    self.xj_project_config,
+                    "queue_log_stdout",
+                    os.environ.get("LMCACHE_XJ_QUEUE_LOG_STDOUT", "0") == "1",
+                ),
+                queue_log_interval=float(
+                    _config_value(
+                        self.xj_project_config,
+                        "queue_log_interval",
+                        os.environ.get("LMCACHE_XJ_QUEUE_LOG_INTERVAL", "0.5"),
+                    )
+                ),
             )
         )
 
@@ -279,6 +387,29 @@ class KVCacheManager:
         adapter = getattr(self, "_xj_adapter", None)
         return adapter is not None and adapter.supports(self.compress_type)
 
+    def _supports_xj_project_store(self) -> bool:
+        adapter = getattr(self, "_xj_adapter", None)
+        if adapter is None:
+            return False
+        if hasattr(adapter, "supports_store"):
+            return adapter.supports_store(self.compress_type)
+        return adapter.supports(self.compress_type)
+
+    def _supports_xj_project_prefetch(self) -> bool:
+        adapter = getattr(self, "_xj_adapter", None)
+        if adapter is None:
+            return False
+        if hasattr(adapter, "supports_prefetch"):
+            return adapter.supports_prefetch(self.compress_type)
+        return adapter.supports(self.compress_type)
+
+    def _is_empty_payload(self, payload: Any) -> bool:
+        if payload is None:
+            return True
+        if isinstance(payload, (list, tuple, dict)):
+            return len(payload) == 0
+        return False
+
     def check_keys_exist(self, keys: list) -> list[bool]:
         """
         Check if the given keys exist in the KV cache.
@@ -323,7 +454,13 @@ class KVCacheManager:
         return  flag
 
     def offload_compress_data(self, key: str, data: List[torch.Tensor], layer_idx: int = None):
-        if self.compress_type != CompressType.NONE:
+        if self.compress_type == CompressType.OURS:
+            if self._supports_xj_project_store():
+                return self.offload_layer_data(
+                    key,
+                    data,
+                    layer_idx=layer_idx,
+                )
             return self.store_data(key, data, layer_idx=layer_idx)
 
         sequence_len = data[0].size(1)
@@ -359,7 +496,7 @@ class KVCacheManager:
         stream worker. For compressor formats that cannot consume raw key/value
         payloads on retrieval, fall back to the existing synchronous store path.
         """
-        if self._supports_xj_project_pipeline():
+        if self._supports_xj_project_store():
             return self._xj_adapter.offload(
                 key,
                 {"key": data[0], "value": data[1]},
@@ -393,7 +530,7 @@ class KVCacheManager:
         return future
         
     def retrieve_by_task_id(self, task_id):
-        if self._supports_xj_project_pipeline():
+        if self._supports_xj_project_prefetch():
             return self._xj_adapter.get_prefetch_result(task_id)
 
         t0 = time.perf_counter()
@@ -405,22 +542,23 @@ class KVCacheManager:
             result = []
             t_transfer_start = time.perf_counter()
             for i, data in enumerate(compress_data_gpu):
-                # if i == 0:
-                #     print(f"[KVManager.retrieve_by_task_id] data[0] keys before transfer={list(data.keys()) if isinstance(data, dict) else type(data)}", flush=True)
+                if self._is_empty_payload(data):
+                    result.append(data)
+                    continue
                 transferred = self.compressor.transfer(data)
-                # if i == 0:
-                #     print(f"[KVManager.retrieve_by_task_id] data[0] keys after transfer={list(transferred.keys()) if isinstance(transferred, dict) else type(transferred)}", flush=True)
                 result.append(transferred)
             t_transfer_end = time.perf_counter()
             profile_log(f"retrieve_by_task_id: transfer {len(compress_data_gpu)} items took {(t_transfer_end-t_transfer_start)*1000:.2f}ms")
             return result
+        if self._is_empty_payload(compress_data_gpu):
+            return compress_data_gpu
         if compress_data_gpu is not None:
-            # print(f"[KVManager.retrieve_by_task_id] single data keys before transfer={list(compress_data_gpu.keys()) if isinstance(compress_data_gpu, dict) else type(compress_data_gpu)}", flush=True)
             return self.compressor.transfer(compress_data_gpu)
         return compress_data_gpu
   
     def retrieve_keys(self , keys: List[str]):
-        if self._supports_xj_project_pipeline():
+        logger.info(f"Retrieving keys: {keys}")
+        if self._supports_xj_project_prefetch():
             return self._xj_adapter.prefetch_remote(keys, device=self.device)
 
         # if keys and len(keys) > 0:

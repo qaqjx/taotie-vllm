@@ -61,8 +61,15 @@ These are ignored via local ignore rules so the runnable scripts remain easy to 
 ## Typical Usage
 
 ```bash
-cd examples/blend_kv_v1/request_rate
-./run_benchmark.sh --methods "OURS KIVI_2BIT NONE" --rates "1,2,4"
+cd exp/request_rate
+bash run_benchmark.sh --methods "OURS,KIVI_2BIT,NONE" --rates "1,2,4"
+```
+
+Run the same benchmark on `cuda:1` with fixed-interval scheduling for sanity checking:
+
+```bash
+cd exp/request_rate
+GPU=1 SCHEDULE=fixed bash run_benchmark.sh --methods "NONE,KIVI_2BIT,OURS,SVDQ"
 ```
 
 The primary runner will:
@@ -71,6 +78,13 @@ The primary runner will:
 2. Wait for the health endpoint.
 3. Run the selected benchmark flow.
 4. Write logs and summaries under the benchmark output locations.
+
+`bench_reuse.py` supports two arrival modes:
+
+- `--schedule poisson`: randomized Poisson arrivals, closer to bursty online traffic
+- `--schedule fixed`: strict `1 / rate` spacing between requests, useful for sanity checks
+
+The shell wrapper forwards `SCHEDULE`/`--schedule` to `bench_reuse.py`.
 
 ## Practical Advice
 

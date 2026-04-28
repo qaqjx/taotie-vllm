@@ -46,7 +46,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--methods", type=str, default="OURS,KIVI_2BIT")
     parser.add_argument("--num-contexts", type=int, default=10)
-    parser.add_argument("--num-requests", type=int, default=10)
+    parser.add_argument(
+        "--num-requests",
+        type=int,
+        default=30,
+        help="Number of benchmark requests per rate (default: 30).",
+    )
     parser.add_argument(
         "--ctx-per-req",
         type=str,
@@ -67,6 +72,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup-delay", type=float, default=3.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--reuse-requests-across-rates",
+        action="store_true",
+        help="Reuse the same prepared request set across rates within a method/round.",
+    )
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        choices=("poisson", "fixed"),
+        default="poisson",
+        help="Request arrival schedule: 'poisson' or fixed interval 'fixed'.",
+    )
     parser.add_argument(
         "--rounds",
         type=int,
@@ -346,6 +363,20 @@ def prepare_requests(
     return prompts
 
 
+def select_shared_requests(shared_requests: Sequence[dict], num_requests: int) -> List[dict]:
+    selected: List[dict] = []
+    for ordinal, request in enumerate(shared_requests[:num_requests], start=1):
+        selected.append(
+            {
+                "ordinal": ordinal,
+                "prompt": request["prompt"],
+                "num_contexts": request["num_contexts"],
+                "question": request["question"],
+            }
+        )
+    return selected
+
+
 async def poisson_schedule(
     entries: Sequence[tuple],
     request_rate: float,
@@ -368,11 +399,31 @@ async def poisson_schedule(
             await asyncio.sleep(delay)
 
 
+async def fixed_interval_schedule(
+    entries: Sequence[tuple],
+    request_rate: float,
+):
+    total = len(entries)
+    if total == 0:
+        return
+    if math.isinf(request_rate) or request_rate <= 0:
+        for entry in entries:
+            yield entry
+        return
+    interval = 1.0 / request_rate
+    for idx, entry in enumerate(entries):
+        yield entry
+        if idx == total - 1:
+            break
+        await asyncio.sleep(interval)
+
+
 async def run_requests_for_rate(
     session: aiohttp.ClientSession,
     prepared_requests: Sequence[dict],
     request_rate: float,
     rng: np.random.Generator,
+    schedule_mode: str = "poisson",
 ):
     entries = []
     for req in prepared_requests:
@@ -380,7 +431,12 @@ async def run_requests_for_rate(
         entries.append((name, req["prompt"], req))
 
     tasks = []
-    async for entry in poisson_schedule(entries, request_rate, rng):
+    if schedule_mode == "fixed":
+        schedule_iter = fixed_interval_schedule(entries, request_rate)
+    else:
+        schedule_iter = poisson_schedule(entries, request_rate, rng)
+
+    async for entry in schedule_iter:
         request_name, prompt, meta = entry
         task = asyncio.create_task(
             helpers.stream_completion(
@@ -503,7 +559,8 @@ def print_final_table(rows: List[dict]) -> None:
         return
     header = (
         f"{'Method':<12}{'Rate':>8}{'Headers':>12}{'1stChunk':>12}"
-        f"{'1stChoice':>12}{'SrvTTFT':>12}{'->Blend':>12}{'Success':>12}"
+        f"{'1stChoice':>12}{'1stP50':>12}{'1stP90':>12}"
+        f"{'SrvTTFT':>12}{'->Blend':>12}{'Success':>12}"
     )
     print("\n" + "=" * len(header))
     print("Final Summary")
@@ -519,6 +576,8 @@ def print_final_table(rows: List[dict]) -> None:
             f"{format_ms(row['headers_avg']):>12}"
             f"{format_ms(row['first_chunk_avg']):>12}"
             f"{format_ms(row['avg']):>12}"
+            f"{format_ms(row['p50']):>12}"
+            f"{format_ms(row['p90']):>12}"
             f"{format_ms(row['server_true_ttft_avg']):>12}"
             f"{format_ms(row['server_blender_done_avg']):>12}"
             f"{success_str:>12}"
@@ -541,6 +600,8 @@ async def run_method_benchmark(
     base_seed: int,
     rounds: int = 1,
     match_rate: bool = False,
+    schedule_mode: str = "poisson",
+    reuse_requests_across_rates: bool = False,
 ) -> Dict[float, dict]:
     print("\n" + "=" * 60)
     print(f"Testing compression method: {method}")
@@ -553,20 +614,19 @@ async def run_method_benchmark(
         await asyncio.sleep(warmup_delay)
 
     method_results: Dict[float, dict] = {}
-    for rate_idx, rate in enumerate(rates):
-        # If match_rate is True, num_requests = rate (e.g., rate=4 sends 4 requests in 1 second)
-        effective_num_requests = max(1, int(rate)) if match_rate else num_requests
-        print("-" * 60)
-        print(f"Running rate={_format_rate(rate)} RPS ({effective_num_requests} requests in 1s, {rounds} round(s))")
+    effective_num_requests_by_rate = [
+        max(1, int(rate)) if match_rate else num_requests
+        for rate in rates
+    ]
+    max_num_requests = max(effective_num_requests_by_rate, default=num_requests)
+    shared_requests_by_round: Dict[int, List[dict]] = {}
 
-        best_result = None
-        best_ttft_avg = float("inf")
-
+    if reuse_requests_across_rates:
         for round_num in range(1, rounds + 1):
-            rng_seed = base_seed * 1000 + rate_idx * 100 + round_num
+            rng_seed = base_seed * 1000 + round_num
             req_rng = random.Random(rng_seed)
-            prepared = prepare_requests(
-                num_requests=effective_num_requests,
+            shared_requests_by_round[round_num] = prepare_requests(
+                num_requests=max_num_requests,
                 context_entries=context_entries,
                 question_pool=question_pool,
                 ctx_range=ctx_range,
@@ -574,6 +634,36 @@ async def run_method_benchmark(
                 sep_tokens=sep_tokens,
                 rng=req_rng,
             )
+
+    for rate_idx, rate in enumerate(rates):
+        # If match_rate is True, num_requests = rate (e.g., rate=4 sends 4 requests in 1 second)
+        effective_num_requests = effective_num_requests_by_rate[rate_idx]
+        print("-" * 60)
+        print(
+            f"Running rate={_format_rate(rate)} RPS "
+            f"({effective_num_requests} requests, schedule={schedule_mode}, {rounds} round(s))"
+        )
+
+        best_result = None
+        best_ttft_avg = float("inf")
+
+        for round_num in range(1, rounds + 1):
+            rng_seed = base_seed * 1000 + rate_idx * 100 + round_num
+            if reuse_requests_across_rates:
+                prepared = select_shared_requests(
+                    shared_requests_by_round[round_num], effective_num_requests
+                )
+            else:
+                req_rng = random.Random(rng_seed)
+                prepared = prepare_requests(
+                    num_requests=effective_num_requests,
+                    context_entries=context_entries,
+                    question_pool=question_pool,
+                    ctx_range=ctx_range,
+                    tokenizer=tokenizer,
+                    sep_tokens=sep_tokens,
+                    rng=req_rng,
+                )
             poisson_rng = np.random.default_rng(rng_seed + 12345)
 
             if rounds > 1:
@@ -584,6 +674,7 @@ async def run_method_benchmark(
                 prepared_requests=prepared,
                 request_rate=rate,
                 rng=poisson_rng,
+                schedule_mode=schedule_mode,
             )
 
             ttft_avg = result["summary"]["ttft"].get("avg")
@@ -670,6 +761,8 @@ async def main_async() -> None:
         )
     print(f"Request rates: {', '.join(_format_rate(r) for r in rates)}")
     print(f"Requests per rate: {args.num_requests}")
+    print(f"Reuse requests across rates: {args.reuse_requests_across_rates}")
+    print(f"Schedule mode: {args.schedule}")
     print(f"Rounds per rate: {args.rounds}")
     print(f"Compression methods: {methods}")
     print("=" * 60)
@@ -695,6 +788,8 @@ async def main_async() -> None:
                 base_seed=seed_offset,
                 rounds=args.rounds,
                 match_rate=args.match_rate,
+                schedule_mode=args.schedule,
+                reuse_requests_across_rates=args.reuse_requests_across_rates,
             )
             all_results[method] = method_results
 

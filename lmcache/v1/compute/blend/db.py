@@ -59,29 +59,40 @@ class DataCenter:
     
 
     def retrieve_keys(self, keys: List[str]):
-        # get by cpu buffer
-        # result = [self.cpu_buffer_pool.get_data(key) for key in keys]
-        
-        # disk_keys = [keys[i] for i in range(len(keys)) if result[i] is None]
-        # if disk_keys == []:
-        #     return result
         for key in keys:
             self._wait_pending_save(key)
-        task_id = self.disk_io_manager.load_datas(keys, self.device) 
-        # for i, key in enumerate(disk_keys):
-        #     if disk_result_cpu[i] is not None:
-        #         self.cpu_buffer_pool.add_data(key, disk_result_cpu[i].clone())
-        
-        return task_id
-        # merge result
+        existing_indices: List[int] = []
+        existing_keys: List[str] = []
+        for index, key in enumerate(keys):
+            if self.disk_io_manager.exists(key):
+                existing_indices.append(index)
+                existing_keys.append(key)
 
-        for i, key in enumerate(disk_keys):
-            if disk_result[i] is not None:
-                self.cpu_buffer_pool.add_data(key, disk_result[i])
-        result = [data if data is not None else self.cpu_buffer_pool.get_data(key) for data, key in zip(result, keys)]
-        return result
+        task_id = self.disk_io_manager.load_datas(existing_keys, self.device)
+        return {
+            "task_id": task_id,
+            "existing_indices": existing_indices,
+            "requested_len": len(keys),
+        }
 
     def retrive_by_task(self, task_id):
+        if isinstance(task_id, dict):
+            requested_len = int(task_id.get("requested_len", 0))
+            existing_indices = list(task_id.get("existing_indices", []))
+            load_task_id = task_id.get("task_id", -1)
+
+            result_cpu = [[] for _ in range(requested_len)]
+            result_gpu = [[] for _ in range(requested_len)]
+            loaded_cpu, loaded_gpu = self.disk_io_manager.load_task(load_task_id)
+
+            for offset, index in enumerate(existing_indices):
+                if offset < len(loaded_cpu) and loaded_cpu[offset] is not None:
+                    result_cpu[index] = loaded_cpu[offset]
+                if offset < len(loaded_gpu) and loaded_gpu[offset] is not None:
+                    result_gpu[index] = loaded_gpu[offset]
+
+            return result_cpu, result_gpu
+
         result = self.disk_io_manager.load_task(task_id)
         return result
 

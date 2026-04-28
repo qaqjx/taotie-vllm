@@ -67,42 +67,30 @@ def _last_profile_metric(lines, pattern):
 
 
 def _extract_server_profile(lines, request_id: str):
-    matching_indices = [
-        index
-        for index, line in enumerate(lines)
-        if "[PROFILE]" in line and request_id in line
+    request_lines = [
+        line for line in lines if "[PROFILE]" in line and request_id in line
     ]
-    if not matching_indices:
+    if not request_lines:
         return None
 
+    matching_indices = [
+        index for index, line in enumerate(lines) if line in request_lines
+    ]
     start_index = matching_indices[0]
-    end_index = None
-    for index in range(start_index, len(lines)):
-        line = lines[index]
-        if "[PROFILE]" not in line:
-            continue
-        if index > start_index and "scheduler.lookup:" in line and request_id not in line:
-            end_index = index
-            break
-        if "start_load_kv: all requests total took" in line:
-            end_index = index + 1
-            break
-
+    end_index = matching_indices[-1] + 1
     block = lines[start_index:end_index]
-    if not block:
-        return None
 
     retrieve_db_ms = _sum_profile_metric(
-        block, r"retrieve_by_task_id: db\.retrive_by_task took ([0-9.]+)ms"
+        request_lines, r"retrieve_by_task_id: db\.retrive_by_task took ([0-9.]+)ms"
     )
     retrieve_transfer_ms = _sum_profile_metric(
-        block, r"retrieve_by_task_id: transfer \d+ items took ([0-9.]+)ms"
+        request_lines, r"retrieve_by_task_id: transfer \d+ items took ([0-9.]+)ms"
     )
     decompress_ms = 0.0
     copy_ms = 0.0
-    for line in block:
+    for line in request_lines:
         match = re.search(
-            r"get_reuse_kv: layer \d+ decompressed \d+ chunks in ([0-9.]+)ms "
+            r"get_reuse_kv: req=.* layer \d+ decompressed \d+ chunks in ([0-9.]+)ms "
             r"and copied to buffers in ([0-9.]+)ms",
             line,
         )
@@ -110,20 +98,78 @@ def _extract_server_profile(lines, request_id: str):
             decompress_ms += float(match.group(1))
             copy_ms += float(match.group(2))
     blend_forward_ms = _sum_profile_metric(
-        block,
-        r"prefill_select_token: layer=\d+ get_reuse_kv=[0-9.]+ms "
+        request_lines,
+        r"prefill_select_token: req=.* layer=\d+ get_reuse_kv=[0-9.]+ms "
         r"blend_forward=([0-9.]+)ms",
+    )
+    prefetch_submit_ms = _sum_profile_metric(
+        request_lines,
+        r"compute_layer: req=.* layer=\d+ prefetch_chunk_kv took ([0-9.]+)ms",
+    )
+    attn_path_ms = _sum_profile_metric(
+        request_lines,
+        r"compute_layer: req=.* layer=\d+ attn_path=.* took ([0-9.]+)ms",
+    )
+    post_attn_mlp_ms = _sum_profile_metric(
+        request_lines,
+        r"compute_layer: req=.* layer=\d+ post_attn_mlp took ([0-9.]+)ms",
+    )
+    layer_total_ms = _sum_profile_metric(
+        request_lines,
+        r"compute_layer: req=.* layer=\d+ total took ([0-9.]+)ms",
     )
 
     def _last_profile_metric_for_request(pattern):
         value = None
-        for line in lines:
-            if request_id not in line:
-                continue
+        for line in request_lines:
             match = re.search(pattern, line)
             if match:
                 value = float(match.group(1))
         return value
+
+    scheduled_to_first_token_ms = _last_profile_metric_for_request(
+        r"true_server_ttft: req=.* prefill=([0-9.]+)ms",
+    )
+    total_load_path_ms = _last_profile_metric_for_request(
+        r"start_load_kv: req=.* total load-path took ([0-9.]+)ms",
+    )
+    scheduler_lookup_ms = (
+        _last_profile_metric(
+            request_lines, r"scheduler\.lookup: .* took ([0-9.]+)ms"
+        )
+        or 0.0
+    )
+    build_connector_meta_ms = (
+        _last_profile_metric(
+            request_lines, r"build_connector_meta: .* took ([0-9.]+)ms"
+        )
+        or 0.0
+    )
+    process_tokens_ms = (
+        _last_profile_metric(
+            request_lines,
+            r"start_load_kv: req=.* process_tokens .* took ([0-9.]+)ms",
+        )
+        or 0.0
+    )
+    blend_envelope_ms = (
+        _last_profile_metric(
+            request_lines,
+            r"start_load_kv: req=.* blender\.blend total took ([0-9.]+)ms",
+        )
+        or 0.0
+    )
+
+    load_path_core_ms = (
+        retrieve_db_ms
+        + retrieve_transfer_ms
+        + decompress_ms
+        + copy_ms
+        + process_tokens_ms
+        + build_connector_meta_ms
+        + scheduler_lookup_ms
+        + prefetch_submit_ms
+    )
 
     return {
         "request_id": request_id,
@@ -136,30 +182,21 @@ def _extract_server_profile(lines, request_id: str):
         "server_queue_ms": _last_profile_metric_for_request(
             r"true_server_ttft: req=.* queue=([0-9.]+)ms",
         ),
-        "server_prefill_ms": _last_profile_metric_for_request(
-            r"true_server_ttft: req=.* prefill=([0-9.]+)ms",
-        ),
-        "scheduler_lookup_ms": _last_profile_metric(
-            block, r"scheduler\.lookup: .* took ([0-9.]+)ms"
-        ),
-        "build_connector_meta_ms": _last_profile_metric(
-            block, r"build_connector_meta: .* took ([0-9.]+)ms"
-        ),
-        "process_tokens_ms": _last_profile_metric(
-            block,
-            r"start_load_kv: req=.* process_tokens .* took ([0-9.]+)ms",
-        ),
-        "server_blend_envelope_ms": _last_profile_metric(
-            block,
-            r"start_load_kv: req=.* blender\.blend total took ([0-9.]+)ms",
-        ),
-        "server_load_path_ms": _last_profile_metric(
-            block,
-            r"start_load_kv: req=.* total load-path took ([0-9.]+)ms",
-        ),
+        "server_prefill_ms": layer_total_ms or blend_envelope_ms or load_path_core_ms,
+        "server_scheduled_to_first_token_ms": scheduled_to_first_token_ms,
+        "scheduler_lookup_ms": scheduler_lookup_ms,
+        "build_connector_meta_ms": build_connector_meta_ms,
+        "process_tokens_ms": process_tokens_ms,
+        "server_blend_envelope_ms": blend_envelope_ms,
+        "server_load_path_ms": load_path_core_ms,
         "server_blend_core_ms": (
             retrieve_db_ms + retrieve_transfer_ms + decompress_ms + copy_ms + blend_forward_ms
         ),
+        "prefetch_submit_ms": prefetch_submit_ms,
+        "attn_path_ms": attn_path_ms,
+        "post_attn_mlp_ms": post_attn_mlp_ms,
+        "layer_total_ms": layer_total_ms,
+        "server_total_load_path_ms": total_load_path_ms,
         "retrieve_by_task_db_ms": retrieve_db_ms,
         "retrieve_by_task_transfer_ms": retrieve_transfer_ms,
         "decompress_ms": decompress_ms,

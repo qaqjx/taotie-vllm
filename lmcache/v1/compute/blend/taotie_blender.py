@@ -22,6 +22,17 @@ def serialize_and_hash(input_list):
     hash_object = hashlib.md5(serialized_data)
     return hash_object.hexdigest()
 
+
+def build_hash_text(
+    token_chunk,
+    *,
+    world_size: int,
+    run_namespace: str = "",
+):
+    actual_hash = serialize_and_hash(token_chunk)
+    prefix = f"{run_namespace}-" if run_namespace else ""
+    return f"{prefix}wordl_size{world_size}{actual_hash}"
+
 class TaoTieCBlender:
     """
     Cache-blender backend for LMCache.
@@ -38,9 +49,12 @@ class TaoTieCBlender:
         self.cache_engine = cache_engine
         self.gpu_connector = gpu_connector
 
-        enable_sparse = False
-        if config.extra_config is not None:
-            enable_sparse = config.extra_config.get("enable_sparse", False)
+        extra_config = config.extra_config or {}
+        enable_sparse = extra_config.get("enable_sparse", False)
+        xj_project_config = extra_config.get("xj_project", {})
+        self.run_namespace = str(
+            xj_project_config.get("run_namespace", "")
+        ).strip()
 
         self.layerwise_model = infer_model_from_vllm(vllm_model, self, enable_sparse)
 
@@ -74,7 +88,14 @@ class TaoTieCBlender:
                 128,
                 gpu_connector.device
             )
-        self.context_manager = ContextManager(self.rope, self.num_layers,num_heads_kv = self.num_heads_kv ,device=gpu_connector.device ,gpu_connector = self.gpu_connector)
+        self.context_manager = ContextManager(
+            self.rope,
+            self.num_layers,
+            num_heads_kv=self.num_heads_kv,
+            device=gpu_connector.device,
+            gpu_connector=self.gpu_connector,
+            xj_project_config=extra_config.get("xj_project", {}),
+        )
 
     # NOTE(Jiayi): Exposing this `blend_layer` interface as we might
     # want to ochestrate the blending process elsewhere
@@ -123,8 +144,13 @@ class TaoTieCBlender:
         hash_text = []
         for idx in index:
             token_chunk = tokens[idx[0]:idx[1]]
-            actual_hash = serialize_and_hash(token_chunk)
-            hash_text.append("wordl_size" +  str(kwargs.get("hash_val")[0].world_size) + actual_hash)
+            hash_text.append(
+                build_hash_text(
+                    token_chunk,
+                    world_size=kwargs.get("hash_val")[0].world_size,
+                    run_namespace=self.run_namespace,
+                )
+            )
 
         blend_meta = {
             "context_manager": self.context_manager,
@@ -135,6 +161,7 @@ class TaoTieCBlender:
             "hash_text": hash_text,
             "indices": index,
             "input_len": len(tokens),
+            "request_id": kwargs.get("request_id"),
         }
 
         blend_meta["state"] = "store" if flag == 0 else "retrieve"
@@ -149,5 +176,3 @@ class TaoTieCBlender:
             # print(f"index mapping {blend_meta['indices']}")
             # print(f"retrieving KV cache from TaoTie backend {blend_meta['hash_text']}")
         self.blend_layer(tokens, mask, blend_meta, **kwargs)
-
-

@@ -802,6 +802,7 @@ class LMCacheConnectorV1Impl:
                         starts = starts,
                         ends = ends,
                         hash_val = hash_val,
+                        request_id=request.req_id,
                     )
                     blend_end = time.perf_counter()
                     profile_log(

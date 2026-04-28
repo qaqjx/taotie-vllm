@@ -4,18 +4,19 @@
 set -e
 
 # ============== 配置参数 ==============
-GPU=${GPU:-0}
+GPU=${GPU:-1}
 PORT=${PORT:-12345}
 MODEL="mistralai/Mistral-7B-Instruct-v0.3"
 METHODS=${METHODS:-"NONE,KIVI_2BIT,OURS,SVDQ"}
-RATES=${RATES:-"0.1, 0.2 , 0.3 , 0.4 ,0.5,1, 1.5 ,2,4"}
-NUM_CONTEXTS=${NUM_CONTEXTS:-20}
-NUM_REQUESTS=${NUM_REQUESTS:-10}
-CTX_PER_REQ=${CTX_PER_REQ:-"2,5"}
+RATES=${RATES:-"0.1, 0.2 , 0.3 , 0.4 ,0.5, 0.6,0.7, 0.8, 1, 1.5 ,2,4"}
+NUM_CONTEXTS=${NUM_CONTEXTS:-10}
+NUM_REQUESTS=${NUM_REQUESTS:-200}
+CTX_PER_REQ=${CTX_PER_REQ:-"10,10"}
 TARGET_LENGTH=${TARGET_LENGTH:-""}
 WARMUP_DELAY=${WARMUP_DELAY:-20}
 ROUNDS=${ROUNDS:-1}
 MATCH_RATE=${MATCH_RATE:-""}
+SCHEDULE=${SCHEDULE:-poisson}
 OUTPUT_DIR="$(dirname $0)/results"
 LOG_DIR="$(dirname $0)/server_logs"
 PYTHON_BIN=${PYTHON_BIN:-$(command -v python3)}
@@ -132,6 +133,7 @@ run_benchmark() {
         --num-requests $NUM_REQUESTS \
         $extra_args \
         --warmup-delay $WARMUP_DELAY \
+        --schedule "$SCHEDULE" \
         --rounds $ROUNDS \
         $match_rate_arg \
         2>&1 | tee "$OUTPUT_DIR/${method}_benchmark.log"
@@ -151,6 +153,7 @@ main() {
     log "Contexts: $NUM_CONTEXTS"
     log "Requests per rate: $NUM_REQUESTS"
     log "Contexts per request: $CTX_PER_REQ"
+    log "Schedule: $SCHEDULE"
     log "=============================================="
 
     mkdir -p "$OUTPUT_DIR"
@@ -229,6 +232,10 @@ while [[ $# -gt 0 ]]; do
             ROUNDS="$2"
             shift 2
             ;;
+        --schedule)
+            SCHEDULE="$2"
+            shift 2
+            ;;
         --match-rate)
             MATCH_RATE="1"
             shift
@@ -242,8 +249,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --methods 'M1 M2'    Methods to test (default: 'OURS KIVI_2BIT NONE')"
             echo "  --rates '0.5,1,2,4,'    Request rates to test (default: '0.5,1,2,4')"
             echo "  --num-contexts N     Number of contexts for warmup (default: 10)"
-            echo "  --num-requests N     Requests per rate (default: 10)"
+            echo "  --num-requests N     Requests per rate (default: 30)"
             echo "  --ctx-per-req 'a,b'  Contexts per request range (default: '2,3')"
+            echo "  --schedule MODE      Request schedule: poisson|fixed (default: poisson)"
             echo "  --rounds N           Rounds per rate, take minimum (default: 1)"
             echo "  --match-rate         Set num_requests = rate (rate=4 sends 4 requests in 1s)"
             echo "  -h, --help           Show this help"

@@ -23,6 +23,14 @@ def _get_env_compress_type_name() -> str:
     return os.environ.get("LMCACHE_COMPRESS_TYPE", "KIVI_2BIT").upper()
 
 
+def _get_config_compress_type_name(
+    xj_project_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    if xj_project_config and xj_project_config.get("compress_type"):
+        return str(xj_project_config["compress_type"]).upper()
+    return _get_env_compress_type_name()
+
+
 def get_kvcache_filename(
     hash_str: str,
     layer_idx: int = -1,
@@ -91,6 +99,7 @@ class ContextManager:
         dtype = torch.bfloat16,
         gpu_connector = None,
         device: str = "cuda",
+        xj_project_config: Optional[Dict[str, Any]] = None,
     ):
         self.gpu_connector = gpu_connector
         self.dtype = dtype
@@ -102,17 +111,26 @@ class ContextManager:
         self.initialized = False
         self.device = device
         self.layer_num = layer_num
-        self.compress_type = _get_env_compress_type_name()
+        self.xj_project_config = xj_project_config or {}
+        self.compress_type = _get_config_compress_type_name(
+            self.xj_project_config
+        )
         self.phase = "prefill"
         self.shape = (self.batch_size , 1 , self.num_heads_kv , self.head_dim) 
-        self.kv_manager = KVCacheManager.get_instance(shape = self.shape ,layer_num = self.layer_num , device=self.device)
+        self.kv_manager = KVCacheManager.get_instance(
+            shape=self.shape,
+            layer_num=self.layer_num,
+            device=self.device,
+            compress_type=self.compress_type,
+            xj_project_config=self.xj_project_config,
+        )
 
         self.lengths = [0 for _ in range(layer_num)]
         self.kv = [None for _ in range(layer_num)]
 
         self.reuse_kv_finished = [False for _ in range(layer_num)]
         self.tasks = [None for _ in range(layer_num)] # prefetch tasks
-        self.all_reuse_cache = None
+        self.ping_pong_cache = None
         self.compress_data = [None for _ in range(layer_num)]
         self.active_hash_text: List[str] = []
         self.active_indices: List[List[int]] = []
@@ -121,15 +139,14 @@ class ContextManager:
         self.requested_indices: List[List[int]] = []
         self.missing_hash_text: List[str] = []
         self.missing_indices: List[List[int]] = []
-
-        # self.transfer_stream = [torch.cuda.Stream(device=self.device) for _ in range(2)]
+        self.active_request_id: Optional[str] = None
 
     def reset(self):
         self.lengths = [0 for _ in range(self.layer_num)]
         self.kv = [None for _ in range(self.layer_num)]
         self.reuse_kv_finished = [False for _ in range(self.layer_num)]
         self.tasks = [None for _ in range(self.layer_num)] # prefetch tasks
-        self.all_reuse_cache = None
+        self.ping_pong_cache = None
         self.compress_data = [None for _ in range(self.layer_num)]
         self.active_hash_text = []
         self.active_indices = []
@@ -138,6 +155,14 @@ class ContextManager:
         self.requested_indices = []
         self.missing_hash_text = []
         self.missing_indices = []
+        self.active_request_id = None
+
+    def _req_prefix(self) -> str:
+        return (
+            f"req={self.active_request_id} "
+            if self.active_request_id
+            else ""
+        )
 
     def has_valid_reuse(self) -> bool:
         return len(self.active_indices) > 0
@@ -160,12 +185,8 @@ class ContextManager:
         self.indices = self.get_effective_indices()
         self.compress_data = [None for _ in range(self.layer_num)]
 
-        if not self.has_valid_reuse():
-            self.all_reuse_cache = None
-            return
-
         alloc_start = time.perf_counter()
-        self.all_reuse_cache = [
+        self.ping_pong_cache = [
             {
                 "key": torch.zeros(
                     (self.batch_size, kv_len, self.num_heads_kv * self.head_dim),
@@ -178,12 +199,12 @@ class ContextManager:
                     device=self.device,
                 ),
             }
-            for _ in range(self.layer_num)
+            for _ in range(2)
         ]
 
         logger.info(
             "ContextManager: Initializing all_reuse_cache for "
-            f"{self.all_reuse_cache[0]['key'].shape} layers."
+            f"{self.ping_pong_cache[0]['key'].shape} layers."
         )
         alloc_end = time.perf_counter()
         profile_log(
@@ -202,6 +223,168 @@ class ContextManager:
             return len(payload) == 0
         return False
 
+    def _is_ours_compress(self) -> bool:
+        return (
+            getattr(self.kv_manager, "compress_type", None) == CompressType.OURS
+            or str(self.compress_type).upper() == "OURS"
+        )
+
+    def _uses_xj_project_prefetch(self) -> bool:
+        supports_prefetch = getattr(
+            self.kv_manager, "_supports_xj_project_prefetch", None
+        )
+        if supports_prefetch is None:
+            return False
+        return bool(supports_prefetch())
+
+    def _merge_split_ours_payload(self, key_sv_payload: Any, other_payload: Any) -> Any:
+        if self._is_empty_reuse_payload(key_sv_payload) or self._is_empty_reuse_payload(
+            other_payload
+        ):
+            return {}
+        merged = dict(other_payload)
+        merged.update(key_sv_payload)
+        return merged
+
+    def _has_complete_ours_payload(self, payload: Any) -> bool:
+        if self._is_empty_reuse_payload(payload) or not isinstance(payload, dict):
+            return False
+        if {"key", "value"}.issubset(payload):
+            return True
+        return {
+            "key_sv_quantized",
+            "key_sv_meta",
+            "key_residual_sv",
+            "u_quantized",
+            "u_meta",
+            "value_sv_quantized",
+            "value_sv_meta",
+            "value_residual_sv",
+        }.issubset(payload)
+
+    def _all_ours_payloads_complete(self, payloads: Any) -> bool:
+        if not isinstance(payloads, list):
+            return False
+        return all(self._has_complete_ours_payload(payload) for payload in payloads)
+
+    def _base_reuse_paths(self, layer_idx: int) -> List[str]:
+        return [
+            get_kvcache_filename(
+                text,
+                layer_idx=layer_idx,
+                device=self.device,
+                compress_type=self.compress_type,
+            )
+            for text in self.active_hash_text
+        ]
+
+    def _submit_ours_retrieve(self, layer_idx: int):
+        base_paths = self._base_reuse_paths(layer_idx)
+        if self._uses_xj_project_prefetch():
+            return self.kv_manager.retrieve_keys(base_paths)
+        
+        key_sv_paths = [f"{path}_key_sv" for path in base_paths]
+        if layer_idx > 2 and hasattr(self, "key_sv_filter_idx"):
+            key_sv_paths = [
+                path
+                for idx, path in enumerate(key_sv_paths)
+                if idx in self.key_sv_filter_idx
+            ]
+        other_paths = [f"{path}_other" for path in base_paths]
+        return (
+            self.kv_manager.retrieve_keys(key_sv_paths),
+            self.kv_manager.retrieve_keys(other_paths),
+        )
+
+    # def _materialize_single_retrieve_result(self, layer_idx: int, task_id):
+    #     if self._is_ours_compress() and isinstance(task_id, tuple):
+    #         original_task = self.compress_data[layer_idx]
+    #         self.compress_data[layer_idx] = task_id
+    #         try:
+    #             return self._materialize_split_ours_payloads(layer_idx)
+    #         finally:
+    #             self.compress_data[layer_idx] = original_task
+    #     return self.kv_manager.retrieve_by_task_id(task_id=task_id)
+
+    # def _materialize_ours_with_retry(self, layer_idx: int) -> List[Any]:
+    #     timeout_s = float(os.environ.get("LMCACHE_XJ_RETRIEVE_RETRY_TIMEOUT_S", "0"))
+    #     interval_s = float(os.environ.get("LMCACHE_XJ_RETRIEVE_RETRY_INTERVAL_S", "0.05"))
+    #     deadline = None if timeout_s <= 0 else time.perf_counter() + timeout_s
+    #     task_id = self.compress_data[layer_idx]
+
+    #     while True:
+    #         payloads = self._materialize_single_retrieve_result(layer_idx, task_id)
+    #         if self._all_ours_payloads_complete(payloads):
+    #             return payloads
+    #         if deadline is not None and time.perf_counter() >= deadline:
+    #             profile_log(
+    #                 "materialize_ours_with_retry: timed out waiting for complete "
+    #                 f"split payloads at layer {layer_idx}"
+    #             )
+    #             raise RuntimeError(
+    #                 f"Timed out waiting for complete OURS split payloads at layer {layer_idx}"
+    #             )
+    #         if interval_s > 0:
+    #             time.sleep(interval_s)
+    #         task_id = self._submit_ours_retrieve(layer_idx)
+
+    # def _materialize_split_ours_payloads(self, layer_idx: int) -> List[Any]:
+    #     key_sv_task_id, other_task_id = self.compress_data[layer_idx]
+    #     key_sv_data = self.kv_manager.retrieve_by_task_id(task_id=key_sv_task_id)
+    #     other_data = self.kv_manager.retrieve_by_task_id(task_id=other_task_id)
+
+    #     if layer_idx == 1:
+    #         self.key_sv_idx = list(range(len(other_data)))
+    #         self.key_sv_filter_idx = []
+    #         uuid_list: List[torch.Tensor] = []
+    #         for idx in range(len(other_data)):
+    #             if idx >= len(key_sv_data) or self._is_empty_reuse_payload(
+    #                 key_sv_data[idx]
+    #             ):
+    #                 self.key_sv_idx[idx] = -1
+    #                 continue
+
+    #             uuid = key_sv_data[idx].get("uuid")
+    #             if uuid is None:
+    #                 self.key_sv_filter_idx.append(idx)
+    #                 self.key_sv_idx[idx] = len(uuid_list)
+    #                 uuid_list.append(torch.tensor([], device=self.device))
+    #                 continue
+
+    #             matched_index = -1
+    #             for existing_idx, existing_uuid in enumerate(uuid_list):
+    #                 if uuid.equal(existing_uuid):
+    #                     matched_index = existing_idx
+    #                     break
+    #             if matched_index == -1:
+    #                 self.key_sv_filter_idx.append(idx)
+    #                 self.key_sv_idx[idx] = len(uuid_list)
+    #                 uuid_list.append(uuid)
+    #             else:
+    #                 self.key_sv_idx[idx] = matched_index
+
+    #     merged_payloads = []
+    #     for idx, other_payload in enumerate(other_data):
+    #         key_sv_index = idx
+    #         if layer_idx > 2 and hasattr(self, "key_sv_idx"):
+    #             key_sv_index = self.key_sv_idx[idx]
+
+    #         if key_sv_index < 0 or key_sv_index >= len(key_sv_data):
+    #             merged_payloads.append({})
+    #             continue
+    #         merged_payloads.append(
+    #             self._merge_split_ours_payload(
+    #                 key_sv_data[key_sv_index],
+    #                 other_payload,
+    #             )
+    #         )
+    #     return merged_payloads
+
+    def _materialize_compress_data(self, layer_idx: int) -> List[Any]:
+        # if self._is_ours_compress():
+        #     return self._materialize_ours_with_retry(layer_idx)
+        return self.kv_manager.retrieve_by_task_id(task_id=self.compress_data[layer_idx])
+
     def _compact_reuse_hits(self, payloads: List[Any]) -> List[Any]:
         if not self.has_valid_reuse():
             return []
@@ -211,12 +394,6 @@ class ContextManager:
             len(self.active_indices),
             len(payloads),
         )
-        if expected_len != len(self.active_hash_text) or expected_len != len(payloads):
-            logger.warning(
-                "Blend reuse payload alignment mismatch: "
-                f"hashes={len(self.active_hash_text)}, "
-                f"indices={len(self.active_indices)}, payloads={len(payloads)}"
-            )
 
         kept_hashes: List[str] = []
         kept_indices: List[List[int]] = []
@@ -253,8 +430,17 @@ class ContextManager:
         self.missing_indices = missing_indices
         self.indices = self.get_effective_indices()
 
+        profile_log(
+            "compact_reuse_hits: "
+            f"requested={len(self.requested_hash_text)} "
+            f"payloads={len(payloads)} "
+            f"kept={len(kept_hashes)} "
+            f"missing={len(missing_hashes)}"
+        )
+        for missing_hash, missing_index in zip(self.missing_hash_text, self.missing_indices):
+            profile_log(f"compact_reuse_miss: {missing_hash} , index {missing_index}")
+
         if not self.has_valid_reuse():
-            self.all_reuse_cache = None
             self.compress_data = [None for _ in range(self.layer_num)]
 
         return kept_payloads
@@ -268,7 +454,7 @@ class ContextManager:
     ) -> None:
         if not self.missing_hash_text:
             return
-
+        profile_log(f"key shape {key_tensor.shape} , missing indices {self.missing_indices}")
         for text_hash, indices in zip(
             self.missing_hash_text,
             self.missing_indices,
@@ -315,11 +501,6 @@ class ContextManager:
         kv_capacity = kvcaches[layer_idx].shape[1] * kvcaches[layer_idx].shape[2]
         kv_len = kv.shape[1]
         slot_len = slot_mapping.shape[0]
-
-        # Debug: print lengths and slot_mapping range
-        if layer_idx == 0:
-            slot_min = slot_mapping.min().item() if slot_len > 0 else -1
-            slot_max = slot_mapping.max().item() if slot_len > 0 else -1
 
         # Truncate to minimum length if mismatched
         if kv_len != slot_len:
@@ -404,7 +585,6 @@ class ContextManager:
                 layer_idx=layer_idx,
             )
 
-
     def prefetch_chunk_kv(self, text_hash: list , indices: list , kv_len: int , layer_idx: int):
         """
         Prefetch the kv cache from the SSD to the CPU.
@@ -420,17 +600,12 @@ class ContextManager:
             return
 
         retrieve_start = time.perf_counter()
-        self.compress_data[layer_idx] = self.kv_manager.retrieve_keys(
-            [
-                get_kvcache_filename(
-                    text,
-                    layer_idx=layer_idx,
-                    device=self.device,
-                    compress_type=self.compress_type,
-                )
-                    for text in self.active_hash_text
-            ]
-        )
+        if self._is_ours_compress():
+            self.compress_data[layer_idx] = self._submit_ours_retrieve(layer_idx)
+        else:
+            self.compress_data[layer_idx] = self.kv_manager.retrieve_keys(
+                self._base_reuse_paths(layer_idx)
+            )
         retrieve_end = time.perf_counter()
         profile_log(
             "prefetch_chunk_kv: retrieve_keys for layer "
@@ -438,50 +613,73 @@ class ContextManager:
             f"{(retrieve_end - retrieve_start) * 1000:.2f}ms"
         )
 
-        if layer_idx == 1 or self.kv_manager.compress_type != CompressType.OURS:
-            self.compress_data[layer_idx] = self.kv_manager.retrieve_by_task_id(task_id=self.compress_data[layer_idx])
-            if layer_idx == 1 and isinstance(self.compress_data[layer_idx], list):
-                self.compress_data[layer_idx] = self._compact_reuse_hits(
-                    self.compress_data[layer_idx]
-                )
-
+        if not self._is_ours_compress():
+            self.compress_data[layer_idx] = self._materialize_compress_data(layer_idx)
 
     def get_reuse_kv(self, layer_idx: int):
         if self.reuse_kv_finished[layer_idx]:
-            profile_log(f"get_reuse_kv: layer {layer_idx} already prepared, skipping.")
+            profile_log(
+                f"get_reuse_kv: {self._req_prefix()}layer {layer_idx} already prepared, skipping."
+            )
             return
 
-        if not isinstance(self.compress_data[layer_idx], list):
+        if self._is_ours_compress() and not self._all_ours_payloads_complete(
+            self.compress_data[layer_idx]
+        ):
             retrieve_task_start = time.perf_counter()
-            self.compress_data[layer_idx] = self.kv_manager.retrieve_by_task_id(task_id=self.compress_data[layer_idx])
+            self.compress_data[layer_idx] = self._materialize_compress_data(layer_idx)
             retrieve_task_end = time.perf_counter()
             profile_log(
-                f"get_reuse_kv: retrieve_by_task_id for layer {layer_idx} took {(retrieve_task_end - retrieve_task_start) * 1000:.2f}ms"
+                f"get_reuse_kv: {self._req_prefix()}materialize complete OURS payloads for layer {layer_idx} took {(retrieve_task_end - retrieve_task_start) * 1000:.2f}ms"
+            )
+        elif not isinstance(self.compress_data[layer_idx], list):
+            retrieve_task_start = time.perf_counter()
+            self.compress_data[layer_idx] = self._materialize_compress_data(layer_idx)
+            retrieve_task_end = time.perf_counter()
+            profile_log(
+                f"get_reuse_kv: {self._req_prefix()}retrieve_by_task_id for layer {layer_idx} took {(retrieve_task_end - retrieve_task_start) * 1000:.2f}ms"
+            )
+        
+        if layer_idx == 1:
+            self.compress_data[layer_idx] = self._compact_reuse_hits(
+                self.compress_data[layer_idx]
             )
 
         decompress_time = 0.0
         copy_time = 0.0
-        for idx , compressed_data in enumerate(self.compress_data[layer_idx]):
-            decompress_start = time.perf_counter()
-            key , value = self.kv_manager.compressor.decompress(compressed_data, kv_len=self.indices[idx][1] - self.indices[idx][0])
-            decompress_time += time.perf_counter() - decompress_start
+        idx = 0
+        for id, compressed_data in enumerate(self.compress_data[layer_idx]):
+            profile_log(f"id {id}: ,compressed data keys {compressed_data.keys() if isinstance(compressed_data, dict) else 'N/A'}")
 
+            decompress_start = time.perf_counter()
+            if not compressed_data:
+                continue
+            if isinstance(compressed_data, dict) and {"key", "value"}.issubset(
+                compressed_data
+            ):
+                key = compressed_data["key"]
+                value = compressed_data["value"]
+            else:
+                key , value = self.kv_manager.compressor.decompress(compressed_data, kv_len=self.indices[idx][1] - self.indices[idx][0])
+            decompress_time += time.perf_counter() - decompress_start
+            profile_log(f"retrieved key shape {key.shape} , original indices {self.indices[idx]}")
             copy_start = time.perf_counter()
-            self.all_reuse_cache[layer_idx]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(key.reshape(self.all_reuse_cache[layer_idx]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
-            self.all_reuse_cache[layer_idx]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(value.reshape(self.all_reuse_cache[layer_idx]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
+            self.ping_pong_cache[layer_idx % 2]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(key.reshape(self.ping_pong_cache[layer_idx % 2]["key"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
+            self.ping_pong_cache[layer_idx % 2]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].copy_(value.reshape(self.ping_pong_cache[layer_idx % 2]["value"][: , self.indices[idx][0] : self.indices[idx][1], :].shape) , non_blocking=True)
+            idx += 1
             copy_time += time.perf_counter() - copy_start
 
         profile_log(
-            f"get_reuse_kv: layer {layer_idx} decompressed {len(self.compress_data[layer_idx])} chunks in {decompress_time * 1000:.2f}ms "
+            f"get_reuse_kv: {self._req_prefix()}layer {layer_idx} decompressed {len(self.compress_data[layer_idx])} chunks in {decompress_time * 1000:.2f}ms "
             f"and copied to buffers in {copy_time * 1000:.2f}ms"
         )
 
         reshape_start = time.perf_counter()
-        self.all_reuse_cache[layer_idx]["key"] = self.all_reuse_cache[layer_idx]["key"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
-        self.all_reuse_cache[layer_idx]["value"] = self.all_reuse_cache[layer_idx]["value"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
+        self.ping_pong_cache[layer_idx % 2]["key"] = self.ping_pong_cache[layer_idx % 2]["key"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
+        self.ping_pong_cache[layer_idx % 2]["value"] = self.ping_pong_cache[layer_idx % 2]["value"].reshape(self.batch_size, -1, self.num_heads_kv, self.head_dim)
         reshape_end = time.perf_counter()
         profile_log(
-            f"get_reuse_kv: reshape and finalize buffers for layer {layer_idx} took {(reshape_end - reshape_start) * 1000:.2f}ms"
+            f"get_reuse_kv: {self._req_prefix()}reshape and finalize buffers for layer {layer_idx} took {(reshape_end - reshape_start) * 1000:.2f}ms"
         )
 
         self.compress_data[layer_idx] = None
@@ -502,6 +700,7 @@ class ContextManager:
         value: (batch_size, len_k, num_heads_kv, head_dim)
         """
         total_start = time.perf_counter()
+        self.active_request_id = self._resolve_group_uuid(blend_meta)
 
         len_k = pre_rope_key.size(1)
         if not self.initialized:
@@ -554,7 +753,7 @@ class ContextManager:
         assert o.size(1) == post_rope_query.size(1)
 
         profile_log(
-            "prefill: "
+            f"prefill: {self._req_prefix()}"
             f"layer={layer_idx} rope={(rope_end - rope_start) * 1000:.2f}ms "
             f"attn={(attn_end - attn_start) * 1000:.2f}ms "
             f"offload={(offload_end - offload_start) * 1000:.2f}ms "
@@ -586,6 +785,7 @@ class ContextManager:
         3. compute the attention
         """
         total_start = time.perf_counter()
+        self.active_request_id = self._resolve_group_uuid(blend_meta)
         assert query.size(1) == blend_meta["input_len"]
 
         reuse_start = time.perf_counter()
@@ -596,9 +796,10 @@ class ContextManager:
         blend_forward_start = time.perf_counter()
         recomputed_idx = blender.blend_forward(
             query, key, value, (
-                self.all_reuse_cache[layer_idx]["key"], 
-                self.all_reuse_cache[layer_idx]["value"]
-            )
+                self.ping_pong_cache[layer_idx % 2]["key"], 
+                self.ping_pong_cache[layer_idx % 2]["value"]
+            ),
+            self.active_indices
         )
         blend_forward_end = time.perf_counter()
 
@@ -609,7 +810,7 @@ class ContextManager:
 
         o = o[:, recomputed_idx, :, :]
         profile_log(
-            "prefill_select_token: "
+            f"prefill_select_token: {self._req_prefix()}"
             f"layer={layer_idx} get_reuse_kv={(reuse_end - reuse_start) * 1000:.2f}ms "
             f"blend_forward={(blend_forward_end - blend_forward_start) * 1000:.2f}ms "
             f"prefill={(prefill_end - prefill_start) * 1000:.2f}ms "
@@ -638,6 +839,7 @@ class ContextManager:
         recomputed_token_idx: (len_q * recompute_ratio)
         """
         total_start = time.perf_counter()
+        self.active_request_id = self._resolve_group_uuid(blend_meta)
 
         # step1: concatenate the key and value
         kv_len = blend_meta["input_len"]
@@ -646,9 +848,9 @@ class ContextManager:
         self.get_reuse_kv(layer_idx)
         reuse_end = time.perf_counter()
         # Shard along the head dimension
-        assert self.all_reuse_cache is not None, "!!! should retrieve all layers' kv in prefill_select_token"
-        retrieve_layer_key = self.all_reuse_cache[layer_idx]["key"]
-        retrieve_layer_value = self.all_reuse_cache[layer_idx]["value"]
+        assert self.ping_pong_cache is not None, "!!! should retrieve all layers' kv in prefill_select_token"
+        retrieve_layer_key = self.ping_pong_cache[layer_idx % 2]["key"]
+        retrieve_layer_value = self.ping_pong_cache[layer_idx % 2]["value"]
 
         assert pre_rope_key.size(2) == self.num_heads_kv
         retrieve_layer_key[:, positions, ...] = pre_rope_key
@@ -709,14 +911,13 @@ class ContextManager:
         self.update_kv(post_rope_key, retrieve_layer_value, layer_idx)
         self.lengths[layer_idx] += kv_len
 
-        self.all_reuse_cache[layer_idx] = None
         assert out.size(1) == positions.size(0)
         transfer_start = time.perf_counter()
         self._transfer_page(layer_idx , blend_meta)
         transfer_end = time.perf_counter()
 
         profile_log(
-            "prefill_blend: "
+            f"prefill_blend: {self._req_prefix()}"
             f"layer={layer_idx} get_reuse_kv={(reuse_end - reuse_start) * 1000:.2f}ms "
             f"rope={(rope_end - rope_start) * 1000:.2f}ms "
             f"attn={(attn_end - attn_start) * 1000:.2f}ms "

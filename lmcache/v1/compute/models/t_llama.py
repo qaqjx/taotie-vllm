@@ -89,6 +89,8 @@ class TaoTieLMCLlamaModel(nn.Module):
         hash_text = blend_meta.get("hash_text", "") if blend_meta else ""
         blend_flag = blend_meta.get("flag", 0) if blend_meta else 0
         state = blend_meta.get("state", "retrieve") if blend_meta else "retrieve"
+        request_id = blend_meta.get("request_id", "") if blend_meta else ""
+        req_prefix = f"req={request_id} " if request_id else ""
 
         input_ids = input_ids.cuda()
         input_len = len(input_ids)
@@ -102,8 +104,11 @@ class TaoTieLMCLlamaModel(nn.Module):
         #     input_ids=input_ids,
         # )
 
-        # Reset context manager for new request
-        if context_manager is not None and state != "store":
+        # Reset context manager for every new request so per-layer positions
+        # and reuse buffers never leak across requests. Store requests also
+        # build rope positions from scratch and must not inherit lengths from
+        # previous retrieve/store executions.
+        if context_manager is not None:
             context_manager.reset()
 
         recomputed_idx = None
@@ -128,7 +133,7 @@ class TaoTieLMCLlamaModel(nn.Module):
                 blend_meta["indices"] = context_manager.get_effective_indices()
                 prefetch_ms = (time.perf_counter() - prefetch_start) * 1000
                 profile_log(
-                    f"compute_layer: layer={idx} prefetch_chunk_kv took {prefetch_ms:.2f}ms"
+                    f"compute_layer: {req_prefix}layer={idx} prefetch_chunk_kv took {prefetch_ms:.2f}ms"
                 )
 
             use_runtime_reuse = (
@@ -179,7 +184,7 @@ class TaoTieLMCLlamaModel(nn.Module):
                 attn_output = context_manager.prefill(q , k , v , idx, blend_meta)
             attn_ms = (time.perf_counter() - attn_start) * 1000
             profile_log(
-                f"compute_layer: layer={idx} attn_path={attn_mode} took {attn_ms:.2f}ms"
+                f"compute_layer: {req_prefix}layer={idx} attn_path={attn_mode} took {attn_ms:.2f}ms"
             )
 
             num_heads = self.vllm_attn_layers[idx].num_heads
@@ -200,9 +205,9 @@ class TaoTieLMCLlamaModel(nn.Module):
             hidden_states = layer.mlp(hidden_states)
             post_attn_ms = (time.perf_counter() - post_attn_start) * 1000
             profile_log(
-                f"compute_layer: layer={idx} post_attn_mlp took {post_attn_ms:.2f}ms"
+                f"compute_layer: {req_prefix}layer={idx} post_attn_mlp took {post_attn_ms:.2f}ms"
             )
             profile_log(
-                "compute_layer: "
+                f"compute_layer: {req_prefix}"
                 f"layer={idx} total took {(time.perf_counter() - layer_start) * 1000:.2f}ms"
             )

@@ -8,6 +8,14 @@ __pycache__/
 docs/*
 openspec/
 *.rst
+*.json
+*.jsonl
+*.csv
+*.png
+*.txt
+*.pid
+*server_env.sh
+*latest*
 # Distribution / packaging
 .Python
 build/
